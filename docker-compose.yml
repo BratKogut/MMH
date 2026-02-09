@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: memecoin-postgres
+    environment:
+      POSTGRES_USER: memecoin
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: memecoin_hunter
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memecoin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - memecoin-network
+
+  # Redis Cache & Streams
+  redis:
+    image: redis:7-alpine
+    container_name: memecoin-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - memecoin-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: memecoin-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - memecoin-network
+
+  # Grafana Dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: memecoin-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: redis-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - memecoin-network
+
+  # Main Application (when ready)
+  # memecoin-hunter:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: memecoin-hunter
+  #   environment:
+  #     DATABASE_URL: postgresql://memecoin:${DB_PASSWORD:-changeme}@postgres:5432/memecoin_hunter
+  #     REDIS_URL: redis://redis:6379
+  #     HELIUS_API_KEY: ${HELIUS_API_KEY}
+  #     ALCHEMY_API_KEY: ${ALCHEMY_API_KEY}
+  #     BIRDEYE_API_KEY: ${BIRDEYE_API_KEY}
+  #     BASESCAN_API_KEY: ${BASESCAN_API_KEY}
+  #     ZERO_X_API_KEY: ${ZERO_X_API_KEY}
+  #     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - memecoin-network
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  memecoin-network:
+    driver: bridge

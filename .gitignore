@@ -1,0 +1,83 @@
+# Environment
+.env
+.env.local
+.env.*.local
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Config & Secrets
+config/config.yaml
+config/secrets.yaml
+*.key
+*.pem
+*.crt
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+dump.sql
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+.vscode/settings.json
+.idea/
+*.iml
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Temporary
+tmp/
+temp/
+*.tmp
