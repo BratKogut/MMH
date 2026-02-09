@@ -1,0 +1,48 @@
+# Risk policies configuration
+# Version tracked - hash included in every risk decision
+
+version: "3.1.0"
+
+# Portfolio limits
+portfolio:
+  max_exposure_usd: 500.0
+  max_positions_total: 20
+  max_positions_per_chain: 5
+  max_single_position_pct: 20.0
+  daily_loss_limit_usd: 200.0
+  weekly_loss_limit_usd: 500.0
+
+# Position sizing
+sizing:
+  solana:
+    strong_buy:
+      base_usd: 50
+      max_usd: 100
+    buy:
+      base_usd: 25
+      max_usd: 50
+  base:
+    strong_buy:
+      base_usd: 30
+      max_usd: 80
+    buy:
+      base_usd: 15
+      max_usd: 40
+
+# Auto-freeze triggers
+auto_freeze:
+  consecutive_losses: 5
+  rapid_loss_threshold_usd: 100  # in 5 minutes
+  provider_error_threshold: 10  # consecutive errors
+
+# Slippage limits per chain
+slippage:
+  solana: 300  # bps
+  base: 300
+  bsc: 500
+
+# Gas limits per chain (USD)
+max_gas:
+  solana: 0.01
+  base: 2.0
+  bsc: 1.0
