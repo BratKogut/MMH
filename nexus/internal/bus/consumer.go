@@ -6,56 +6,59 @@ import (
 	"sync"
 
 	"github.com/rs/zerolog/log"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // MessageHandler processes a consumed message. Returns error to trigger retry.
-type MessageHandler func(ctx context.Context, msg Message) error
+type MessageHandler func(ctx context.Context, topic string, key []byte, value []byte) error
 
 // Consumer reads messages from Kafka/RedPanda topics.
 type Consumer interface {
-	Subscribe(topics []string) error
 	Consume(ctx context.Context, handler MessageHandler) error
 	Close()
 }
 
-// KafkaConsumer wraps confluent-kafka-go consumer.
+// KafkaConsumer wraps franz-go client for consuming from RedPanda/Kafka.
 type KafkaConsumer struct {
-	brokers []string
+	client  *kgo.Client
 	groupID string
 	topics  []string
-	handler MessageHandler
 	mu      sync.Mutex
 	closed  bool
 }
 
-// NewConsumer creates a new Kafka consumer.
-func NewConsumer(brokers []string, groupID string) (Consumer, error) {
-	c := &KafkaConsumer{
-		brokers: brokers,
-		groupID: groupID,
+// NewConsumer creates a real Kafka consumer using franz-go.
+func NewConsumer(brokers []string, groupID string, topics []string) (Consumer, error) {
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumerGroup(groupID),
+		kgo.ConsumeTopics(topics...),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.ClientID(groupID),
+	}
+
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("create kafka consumer: %w", err)
 	}
 
 	log.Info().
 		Strs("brokers", brokers).
 		Str("group_id", groupID).
-		Msg("Kafka consumer created")
+		Strs("topics", topics).
+		Msg("Kafka consumer created (franz-go)")
 
-	return c, nil
+	return &KafkaConsumer{
+		client:  client,
+		groupID: groupID,
+		topics:  topics,
+	}, nil
 }
 
-// Subscribe registers topics to consume from.
-func (c *KafkaConsumer) Subscribe(topics []string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.topics = topics
-	log.Info().Strs("topics", topics).Str("group", c.groupID).Msg("Subscribed to topics")
-	return nil
-}
-
-// Consume starts consuming messages. Blocks until context is cancelled.
+// Consume starts the consume loop. Blocks until context is cancelled.
 func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) error {
 	if len(c.topics) == 0 {
-		return fmt.Errorf("no topics subscribed")
+		return fmt.Errorf("no topics configured")
 	}
 
 	log.Info().
@@ -63,17 +66,45 @@ func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) err
 		Str("group", c.groupID).
 		Msg("Starting consumer loop")
 
-	// TODO: Replace with real Kafka consumer loop
-	// For now, just wait for context cancellation
-	<-ctx.Done()
-	return ctx.Err()
+	for {
+		fetches := c.client.PollFetches(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if errs := fetches.Errors(); len(errs) > 0 {
+			for _, e := range errs {
+				log.Error().
+					Err(e.Err).
+					Str("topic", e.Topic).
+					Int32("partition", e.Partition).
+					Msg("Fetch error")
+			}
+		}
+
+		fetches.EachRecord(func(record *kgo.Record) {
+			if err := handler(ctx, record.Topic, record.Key, record.Value); err != nil {
+				log.Error().Err(err).
+					Str("topic", record.Topic).
+					Int64("offset", record.Offset).
+					Msg("Handler error")
+			}
+		})
+
+		c.client.AllowRebalance()
+	}
 }
 
 // Close shuts down the consumer.
 func (c *KafkaConsumer) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.closed {
+		return
+	}
 	c.closed = true
+	c.client.Close()
 	log.Info().Str("group", c.groupID).Msg("Kafka consumer closed")
 }
 

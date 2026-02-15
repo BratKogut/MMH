@@ -7,128 +7,152 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Message represents a message to be published to Kafka.
-type Message struct {
-	Topic     string
-	Key       string // partition key
-	Value     []byte
-	Headers   map[string]string
-	Timestamp time.Time
-}
-
 // Producer publishes messages to Kafka/RedPanda.
-// This is an interface so we can swap implementations (real Kafka vs in-memory for tests).
 type Producer interface {
-	Publish(ctx context.Context, msg Message) error
+	Produce(ctx context.Context, topic string, key []byte, value []byte) error
+	ProduceSync(ctx context.Context, topic string, key []byte, value []byte) error
 	PublishJSON(ctx context.Context, topic, key string, value interface{}) error
-	Flush(timeout time.Duration) int
 	Close()
 }
 
-// KafkaProducer wraps confluent-kafka-go producer.
-// For now, uses a channel-based mock that can be replaced with real Kafka.
+// KafkaProducer wraps franz-go client for producing to RedPanda/Kafka.
 type KafkaProducer struct {
-	brokers        []string
-	defaultHeaders map[string]string
-	messages       []Message // in-memory buffer for development
-	mu             sync.Mutex
-	closed         bool
+	client  *kgo.Client
+	mu      sync.Mutex
+	closed  bool
+	brokers []string
 }
 
-// NewProducer creates a new Kafka producer.
-func NewProducer(brokers []string, instanceID string, schemaVersion string) (Producer, error) {
-	p := &KafkaProducer{
-		brokers: brokers,
-		defaultHeaders: map[string]string{
-			"producer":       instanceID,
-			"schema_version": schemaVersion,
-		},
-		messages: make([]Message, 0, 1024),
+// NewProducer creates a real Kafka producer using franz-go.
+func NewProducer(brokers []string, instanceID string) (Producer, error) {
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.ProducerBatchMaxBytes(1024 * 1024), // 1MB batch
+		kgo.ProducerLinger(5 * time.Millisecond),
+		kgo.ClientID(instanceID),
+	}
+
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("create kafka producer: %w", err)
 	}
 
 	log.Info().
 		Strs("brokers", brokers).
 		Str("instance_id", instanceID).
-		Msg("Kafka producer created")
+		Msg("Kafka producer created (franz-go)")
 
-	return p, nil
+	return &KafkaProducer{
+		client:  client,
+		brokers: brokers,
+	}, nil
 }
 
-// Publish sends a message to Kafka.
-func (p *KafkaProducer) Publish(ctx context.Context, msg Message) error {
+// Produce sends a message asynchronously (fire-and-forget with buffering).
+func (p *KafkaProducer) Produce(ctx context.Context, topic string, key []byte, value []byte) error {
 	if p.closed {
 		return fmt.Errorf("producer is closed")
 	}
 
-	// Add default headers
-	if msg.Headers == nil {
-		msg.Headers = make(map[string]string)
+	record := &kgo.Record{
+		Topic: topic,
+		Key:   key,
+		Value: value,
 	}
-	for k, v := range p.defaultHeaders {
-		if _, exists := msg.Headers[k]; !exists {
-			msg.Headers[k] = v
+
+	p.client.Produce(ctx, record, func(r *kgo.Record, err error) {
+		if err != nil {
+			log.Error().Err(err).
+				Str("topic", r.Topic).
+				Msg("Async produce failed")
 		}
-	}
-
-	// Add event_id if not present
-	if _, ok := msg.Headers["event_id"]; !ok {
-		msg.Headers["event_id"] = uuid.New().String()
-	}
-
-	if msg.Timestamp.IsZero() {
-		msg.Timestamp = time.Now()
-	}
-
-	p.mu.Lock()
-	p.messages = append(p.messages, msg)
-	p.mu.Unlock()
-
-	log.Debug().
-		Str("topic", msg.Topic).
-		Str("key", msg.Key).
-		Int("value_size", len(msg.Value)).
-		Msg("Message published")
+	})
 
 	return nil
 }
 
-// PublishJSON serializes value as JSON and publishes.
+// ProduceSync sends a message and waits for broker acknowledgement.
+func (p *KafkaProducer) ProduceSync(ctx context.Context, topic string, key []byte, value []byte) error {
+	if p.closed {
+		return fmt.Errorf("producer is closed")
+	}
+
+	record := &kgo.Record{
+		Topic: topic,
+		Key:   key,
+		Value: value,
+	}
+
+	results := p.client.ProduceSync(ctx, record)
+	return results.FirstErr()
+}
+
+// PublishJSON serializes value as JSON and publishes asynchronously.
 func (p *KafkaProducer) PublishJSON(ctx context.Context, topic, key string, value interface{}) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("marshal JSON: %w", err)
 	}
-
-	return p.Publish(ctx, Message{
-		Topic: topic,
-		Key:   key,
-		Value: data,
-	})
+	return p.Produce(ctx, topic, []byte(key), data)
 }
 
-// Flush waits for all messages to be delivered.
-func (p *KafkaProducer) Flush(timeout time.Duration) int {
+// Close flushes pending messages and shuts down the producer.
+func (p *KafkaProducer) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	remaining := len(p.messages)
-	return remaining
-}
 
-// Close shuts down the producer.
-func (p *KafkaProducer) Close() {
+	if p.closed {
+		return
+	}
 	p.closed = true
+	p.client.Close()
 	log.Info().Msg("Kafka producer closed")
 }
 
-// GetMessages returns buffered messages (for testing).
-func (p *KafkaProducer) GetMessages() []Message {
+// --- Stub producer for development/testing ---
+
+// StubProducer implements Producer by logging messages. Used when Kafka is unavailable.
+type StubProducer struct {
+	Messages []StubMessage
+	mu       sync.Mutex
+}
+
+type StubMessage struct {
+	Topic string
+	Key   string
+	Value []byte
+}
+
+func NewStubProducer() *StubProducer {
+	return &StubProducer{Messages: make([]StubMessage, 0, 1024)}
+}
+
+func (p *StubProducer) Produce(_ context.Context, topic string, key []byte, value []byte) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	result := make([]Message, len(p.messages))
-	copy(result, p.messages)
-	return result
+	p.Messages = append(p.Messages, StubMessage{Topic: topic, Key: string(key), Value: value})
+	p.mu.Unlock()
+	log.Debug().Str("topic", topic).Int("bytes", len(value)).Msg("stub: produce")
+	return nil
+}
+
+func (p *StubProducer) ProduceSync(ctx context.Context, topic string, key []byte, value []byte) error {
+	return p.Produce(ctx, topic, key, value)
+}
+
+func (p *StubProducer) PublishJSON(ctx context.Context, topic, key string, value interface{}) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return p.Produce(ctx, topic, []byte(key), data)
+}
+
+func (p *StubProducer) Close() {
+	log.Info().Msg("stub: producer closed")
 }
