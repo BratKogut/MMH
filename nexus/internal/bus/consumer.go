@@ -9,16 +9,20 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// MessageHandler processes a consumed message. Returns error to trigger retry.
-type MessageHandler func(ctx context.Context, topic string, key []byte, value []byte) error
+// MessageHandler processes a consumed message.
+// Return error to indicate processing failure (the message will still be committed).
+type MessageHandler func(ctx context.Context, msg Message) error
 
 // Consumer reads messages from Kafka/RedPanda topics.
 type Consumer interface {
+	// Consume starts the poll loop. Blocks until ctx is cancelled.
 	Consume(ctx context.Context, handler MessageHandler) error
+	// Close shuts down the consumer and commits final offsets.
 	Close()
 }
 
-// KafkaConsumer wraps franz-go client for consuming from RedPanda/Kafka.
+// KafkaConsumer is a real Kafka consumer backed by franz-go with consumer group support.
+// It uses automatic offset commits and cooperative rebalancing.
 type KafkaConsumer struct {
 	client  *kgo.Client
 	groupID string
@@ -27,44 +31,58 @@ type KafkaConsumer struct {
 	closed  bool
 }
 
-// NewConsumer creates a real Kafka consumer using franz-go.
-func NewConsumer(brokers []string, groupID string, topics []string) (Consumer, error) {
-	opts := []kgo.Opt{
+// NewConsumer creates a new Kafka consumer with consumer group support.
+// Topics are subscribed at creation time. The consumer uses auto-commit
+// and resets to the earliest available offset for new consumer groups.
+func NewConsumer(brokers []string, groupID string, topics []string) (*KafkaConsumer, error) {
+	if len(topics) == 0 {
+		return nil, fmt.Errorf("at least one topic is required")
+	}
+
+	kgoOpts := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
+		kgo.ClientID(groupID),
 		kgo.ConsumerGroup(groupID),
 		kgo.ConsumeTopics(topics...),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		kgo.ClientID(groupID),
 	}
 
-	client, err := kgo.NewClient(opts...)
+	client, err := kgo.NewClient(kgoOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create kafka consumer: %w", err)
+	}
+
+	c := &KafkaConsumer{
+		client:  client,
+		groupID: groupID,
+		topics:  topics,
 	}
 
 	log.Info().
 		Strs("brokers", brokers).
 		Str("group_id", groupID).
 		Strs("topics", topics).
-		Msg("Kafka consumer created (franz-go)")
+		Msg("kafka consumer created (franz-go)")
 
-	return &KafkaConsumer{
-		client:  client,
-		groupID: groupID,
-		topics:  topics,
-	}, nil
+	return c, nil
 }
 
-// Consume starts the consume loop. Blocks until context is cancelled.
+// Consume starts the consumer poll loop. Blocks until ctx is cancelled.
+// Each fetched record is converted to a Message and passed to the handler.
+// Handler errors are logged but do not stop consumption. Offsets are
+// auto-committed by the franz-go client.
 func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) error {
-	if len(c.topics) == 0 {
-		return fmt.Errorf("no topics configured")
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("consumer is closed")
 	}
+	c.mu.Unlock()
 
 	log.Info().
 		Strs("topics", c.topics).
 		Str("group", c.groupID).
-		Msg("Starting consumer loop")
+		Msg("starting consumer loop")
 
 	for {
 		fetches := c.client.PollFetches(ctx)
@@ -73,39 +91,59 @@ func (c *KafkaConsumer) Consume(ctx context.Context, handler MessageHandler) err
 		}
 
 		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
+			for _, fe := range errs {
 				log.Error().
-					Err(e.Err).
-					Str("topic", e.Topic).
-					Int32("partition", e.Partition).
-					Msg("Fetch error")
+					Err(fe.Err).
+					Str("topic", fe.Topic).
+					Int32("partition", fe.Partition).
+					Msg("fetch error")
 			}
 		}
 
 		fetches.EachRecord(func(record *kgo.Record) {
-			if err := handler(ctx, record.Topic, record.Key, record.Value); err != nil {
+			msg := recordToMessage(record)
+			if err := handler(ctx, msg); err != nil {
 				log.Error().Err(err).
 					Str("topic", record.Topic).
+					Int32("partition", record.Partition).
 					Int64("offset", record.Offset).
-					Msg("Handler error")
+					Msg("message handler error")
 			}
 		})
 
+		// Signal to the consumer group that we're ready for rebalancing
+		// if the group coordinator has requested it.
 		c.client.AllowRebalance()
 	}
 }
 
-// Close shuts down the consumer.
+// Close shuts down the consumer, committing final offsets.
 func (c *KafkaConsumer) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.closed {
+		c.mu.Unlock()
 		return
 	}
 	c.closed = true
+	c.mu.Unlock()
+
 	c.client.Close()
-	log.Info().Str("group", c.groupID).Msg("Kafka consumer closed")
+	log.Info().Str("group", c.groupID).Msg("kafka consumer closed")
+}
+
+// recordToMessage converts a franz-go Record to a bus.Message.
+func recordToMessage(r *kgo.Record) Message {
+	headers := make(map[string]string, len(r.Headers))
+	for _, h := range r.Headers {
+		headers[h.Key] = string(h.Value)
+	}
+	return Message{
+		Topic:     r.Topic,
+		Key:       string(r.Key),
+		Value:     r.Value,
+		Headers:   headers,
+		Timestamp: r.Timestamp,
+	}
 }
 
 // TopicNaming provides canonical topic names following NEXUS naming convention.

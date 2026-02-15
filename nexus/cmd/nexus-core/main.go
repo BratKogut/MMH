@@ -59,7 +59,7 @@ func main() {
 		producer = bus.NewStubProducer()
 		log.Info().Msg("Kafka producer: STUB mode")
 	} else {
-		p, err := bus.NewProducer(cfg.Kafka.Brokers, cfg.General.InstanceID)
+		p, err := bus.NewProducer(cfg.Kafka.Brokers, bus.WithInstanceID(cfg.General.InstanceID))
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to create Kafka producer, falling back to stub")
 			producer = bus.NewStubProducer()
@@ -86,7 +86,7 @@ func main() {
 				chClient.Close()
 				chWriter = &stubCHWriter{}
 			} else {
-				chBatchWriter = chpkg.NewBatchWriter(chClient, 1000, 5*time.Second)
+				chBatchWriter = chpkg.NewBatchWriter(chClient, "nexus", 1000, 5*time.Second)
 				chWriter = chBatchWriter
 				log.Info().Str("dsn", cfg.ClickHouse.DSN).Msg("ClickHouse writer: LIVE")
 			}
