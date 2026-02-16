@@ -1,0 +1,36 @@
+# Scoring weights per chain
+# Each chain has different factors with weights summing to 1.0
+# Changes to this file affect scoring - always bump version
+
+version: "3.1.0"
+
+solana:
+  lp_burned: 0.20
+  holder_distribution: 0.20
+  creator_history: 0.15
+  graduation: 0.15
+  organic_volume: 0.15
+  bonding_momentum: 0.15
+
+base:
+  honeypot_check: 0.25
+  lp_burned: 0.20
+  holder_distribution: 0.20
+  liquidity_depth: 0.15
+  contract_verified: 0.10
+  tax_level: 0.10
+
+bsc:
+  honeypot_check: 0.30
+  lp_burned: 0.20
+  holder_distribution: 0.15
+  pinksale_audit: 0.15
+  contract_verified: 0.10
+  tax_level: 0.10
+
+ton:
+  lp_burned: 0.25
+  holder_distribution: 0.25
+  jetton_compliance: 0.20
+  creator_history: 0.15
+  telegram_presence: 0.15

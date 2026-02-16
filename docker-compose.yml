@@ -1,14 +1,14 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
+  # PostgreSQL 15 with TimescaleDB
   postgres:
-    image: postgres:15-alpine
-    container_name: memecoin-postgres
+    image: timescale/timescaledb:latest-pg15
+    container_name: mmh-postgres
     environment:
-      POSTGRES_USER: memecoin
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-      POSTGRES_DB: memecoin_hunter
+      POSTGRES_USER: mmh
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mmh}
+      POSTGRES_DB: mmh
       TZ: UTC
     ports:
       - "5432:5432"
@@ -16,17 +16,17 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U memecoin"]
+      test: ["CMD-SHELL", "pg_isready -U mmh"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - memecoin-network
+      - mmh-network
 
-  # Redis Cache & Streams
+  # Redis 7 with AOF persistence
   redis:
     image: redis:7-alpine
-    container_name: memecoin-redis
+    container_name: mmh-redis
     ports:
       - "6379:6379"
     volumes:
@@ -38,12 +38,12 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - memecoin-network
+      - mmh-network
 
   # Prometheus Monitoring
   prometheus:
     image: prom/prometheus:latest
-    container_name: memecoin-prometheus
+    container_name: mmh-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -52,13 +52,16 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    depends_on:
+      - mmh
     networks:
-      - memecoin-network
+      - mmh-network
 
   # Grafana Dashboards
   grafana:
     image: grafana/grafana:latest
-    container_name: memecoin-grafana
+    container_name: mmh-grafana
     ports:
       - "3000:3000"
     environment:
@@ -70,32 +73,32 @@ services:
     depends_on:
       - prometheus
     networks:
-      - memecoin-network
+      - mmh-network
 
-  # Main Application (when ready)
-  # memecoin-hunter:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: memecoin-hunter
-  #   environment:
-  #     DATABASE_URL: postgresql://memecoin:${DB_PASSWORD:-changeme}@postgres:5432/memecoin_hunter
-  #     REDIS_URL: redis://redis:6379
-  #     HELIUS_API_KEY: ${HELIUS_API_KEY}
-  #     ALCHEMY_API_KEY: ${ALCHEMY_API_KEY}
-  #     BIRDEYE_API_KEY: ${BIRDEYE_API_KEY}
-  #     BASESCAN_API_KEY: ${BASESCAN_API_KEY}
-  #     ZERO_X_API_KEY: ${ZERO_X_API_KEY}
-  #     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - memecoin-network
-  #   restart: unless-stopped
+  # MMH Application
+  mmh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mmh
+    env_file:
+      - .env
+    environment:
+      MMH_POSTGRES_DSN: postgresql://mmh:${DB_PASSWORD:-mmh}@postgres:5432/mmh
+      MMH_REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mmh-network
+    restart: unless-stopped
 
 volumes:
   postgres_data:
@@ -104,5 +107,5 @@ volumes:
   grafana_data:
 
 networks:
-  memecoin-network:
+  mmh-network:
     driver: bridge

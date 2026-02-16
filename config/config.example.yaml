@@ -1,0 +1,91 @@
+# MMH v3.1 Configuration
+# Copy to config.yaml and fill in your values
+
+general:
+  instance_id: "mmh-node-1"
+  environment: "production"  # production|staging|development
+  dry_run: true  # Start in dry-run mode (RECOMMENDED for first deployment)
+
+redis:
+  url: "redis://localhost:6379"
+  max_memory: "2gb"
+  stream_maxlen: 5000
+
+postgres:
+  dsn: "postgresql://mmh:mmh@localhost:5432/mmh"
+
+wal:
+  data_dir: "./data/wal"
+  checkpoint_interval_seconds: 300
+  retention_hours: 168  # 7 days
+
+zmq:
+  enabled: false  # Optional fast-lane, NOT a durable transport
+  pub_address: "tcp://127.0.0.1:5555"
+  sub_address: "tcp://127.0.0.1:5556"
+
+chains:
+  enabled:
+    - solana
+    - base
+
+solana:
+  rpc_url: ""  # Your Solana RPC URL
+  ws_url: ""
+  helius_api_key: ""  # Required for Solana
+  helius_ws_url: ""
+  birdeye_api_key: ""  # Required for Solana security
+  pumpportal_ws_url: "wss://pumpportal.fun/api/data"
+  jito_tip_lamports: 10000
+
+base:
+  rpc_url: ""  # Your Base RPC URL (Alchemy)
+  ws_url: ""
+  alchemy_api_key: ""
+  goplus_api_url: "https://api.gopluslabs.io/api/v1"
+  zerox_api_key: ""
+
+# SAFETY > PROFIT
+risk:
+  max_portfolio_exposure_usd: 500.0
+  max_positions_per_chain: 5
+  max_single_position_pct: 20.0
+  daily_loss_limit_usd: 200.0
+  max_slippage_bps: 300
+
+scoring:
+  min_score_strong_buy: 80
+  min_score_buy: 60
+
+positions:
+  default_take_profit_levels: [50.0, 100.0, 200.0]
+  default_stop_loss_pct: -30.0
+  default_trailing_stop_pct: 0.0
+  max_holding_seconds: 3600
+
+circuit_breaker:
+  threshold: 5
+  timeout_seconds: 60
+
+rate_limits:
+  birdeye: 1.0
+  goplus: 0.5
+  helius: 10.0
+  basescan: 5.0
+  dexscreener: 5.0
+
+heartbeat:
+  interval_seconds: 10.0
+  timeout_seconds: 30.0
+
+observability:
+  prometheus_port: 8000
+  log_level: "INFO"
+  log_format: "json"  # json|text
+
+telegram:
+  bot_token: ""
+  chat_id: ""
+
+idempotency:
+  dedup_ttl_seconds: 86400  # 24h

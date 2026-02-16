@@ -1,0 +1,35 @@
+name: NEXUS CI
+
+on:
+  push:
+    paths:
+      - 'nexus/**'
+  pull_request:
+    paths:
+      - 'nexus/**'
+
+defaults:
+  run:
+    working-directory: nexus
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Lint
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -race -count=1 -timeout 60s
+
+      - name: Build
+        run: |
+          go build -o bin/nexus-core ./cmd/nexus-core
+          go build -o bin/nexus-intel ./cmd/nexus-intel
