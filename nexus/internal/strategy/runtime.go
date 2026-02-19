@@ -229,6 +229,55 @@ func (r *Runtime) OnTimer(ctx context.Context, ts time.Time, timerID string) err
 	return firstErr
 }
 
+// OnIntelEvent routes an intel event to all enabled strategies whose symbol set
+// overlaps with the event's asset tags. This is the bridge between the Intel
+// Pipeline (Brain) and the Strategy Runtime.
+func (r *Runtime) OnIntelEvent(ctx context.Context, event IntelEvent) error {
+	r.mu.RLock()
+	type target struct {
+		id  string
+		reg *registeredStrategy
+	}
+	targets := make([]target, 0, len(r.strategies))
+	for id, reg := range r.strategies {
+		if !reg.enabled {
+			continue
+		}
+		// If the strategy subscribes to all symbols (empty set) or any matching asset tag.
+		if len(reg.symbolSet) == 0 {
+			targets = append(targets, target{id, reg})
+		} else {
+			for _, tag := range event.AssetTags {
+				if _, ok := reg.symbolSet[tag]; ok {
+					targets = append(targets, target{id, reg})
+					break
+				}
+			}
+		}
+	}
+	r.mu.RUnlock()
+
+	var firstErr error
+	for _, t := range targets {
+		signals := t.reg.strategy.OnIntel(event)
+		for _, sig := range signals {
+			if err := r.processSignal(ctx, t.id, sig); err != nil {
+				atomic.AddInt64(&t.reg.errorCount, 1)
+				if firstErr == nil {
+					firstErr = err
+				}
+				log.Error().Err(err).
+					Str("strategy_id", t.id).
+					Str("intel_event_id", event.EventID).
+					Msg("Error processing intel signal")
+			} else {
+				atomic.AddInt64(&t.reg.signalCount, 1)
+			}
+		}
+	}
+	return firstErr
+}
+
 // OnFeatureUpdate wraps features as a series of MarketEvents and dispatches them.
 func (r *Runtime) OnFeatureUpdate(ctx context.Context, symbol string, features map[string]float64) error {
 	now := time.Now().UnixMilli()
