@@ -16,6 +16,8 @@ type Config struct {
 	Risk       RiskConfig       `yaml:"risk"`
 	Intel      IntelConfig      `yaml:"intel"`
 	Metrics    MetricsConfig    `yaml:"metrics"`
+	Hunter     HunterConfig     `yaml:"hunter"`
+	Solana     SolanaConfig     `yaml:"solana"`
 }
 
 type GeneralConfig struct {
@@ -91,6 +93,37 @@ type MetricsConfig struct {
 	Enabled        bool `yaml:"enabled"`
 }
 
+// SolanaConfig configures Solana RPC connection.
+type SolanaConfig struct {
+	RPCEndpoint  string  `yaml:"rpc_endpoint"`
+	WSEndpoint   string  `yaml:"ws_endpoint"`
+	PrivateKey   string  `yaml:"private_key"`   // base58 encoded
+	RateLimitRPS float64 `yaml:"rate_limit_rps"`
+}
+
+// HunterConfig configures the memecoin hunter/sniper.
+type HunterConfig struct {
+	Enabled              bool     `yaml:"enabled"`
+	DryRun               bool     `yaml:"dry_run"`
+	MonitorDEXes         []string `yaml:"monitor_dexes"`
+	MaxBuySOL            float64  `yaml:"max_buy_sol"`
+	SlippageBps          int      `yaml:"slippage_bps"`
+	TakeProfitMultiplier float64  `yaml:"take_profit_multiplier"`
+	StopLossPct          float64  `yaml:"stop_loss_pct"`
+	TrailingStopEnabled  bool     `yaml:"trailing_stop_enabled"`
+	TrailingStopPct      float64  `yaml:"trailing_stop_pct"`
+	MaxPositions         int      `yaml:"max_positions"`
+	MaxDailyLossSOL      float64  `yaml:"max_daily_loss_sol"`
+	MaxDailySpendSOL     float64  `yaml:"max_daily_spend_sol"`
+	MinSafetyScore       int      `yaml:"min_safety_score"`
+	MinLiquidityUSD      float64  `yaml:"min_liquidity_usd"`
+	MaxTokenAgeMinutes   int      `yaml:"max_token_age_minutes"`
+	AutoSellAfterMinutes int      `yaml:"auto_sell_after_minutes"`
+	UseJito              bool     `yaml:"use_jito"`
+	JitoTipSOL           float64  `yaml:"jito_tip_sol"`
+	PriorityFee          uint64   `yaml:"priority_fee"`
+}
+
 // Load reads and parses a YAML configuration file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -157,5 +190,52 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Risk.FeedLagThresholdMs == 0 {
 		cfg.Risk.FeedLagThresholdMs = 5000
+	}
+	// Solana defaults.
+	if cfg.Solana.RPCEndpoint == "" {
+		cfg.Solana.RPCEndpoint = "https://api.mainnet-beta.solana.com"
+	}
+	if cfg.Solana.WSEndpoint == "" {
+		cfg.Solana.WSEndpoint = "wss://api.mainnet-beta.solana.com"
+	}
+	if cfg.Solana.RateLimitRPS == 0 {
+		cfg.Solana.RateLimitRPS = 10
+	}
+	// Hunter defaults.
+	if len(cfg.Hunter.MonitorDEXes) == 0 {
+		cfg.Hunter.MonitorDEXes = []string{"raydium", "pumpfun"}
+	}
+	if cfg.Hunter.MaxBuySOL == 0 {
+		cfg.Hunter.MaxBuySOL = 0.1
+	}
+	if cfg.Hunter.SlippageBps == 0 {
+		cfg.Hunter.SlippageBps = 200
+	}
+	if cfg.Hunter.TakeProfitMultiplier == 0 {
+		cfg.Hunter.TakeProfitMultiplier = 2.0
+	}
+	if cfg.Hunter.StopLossPct == 0 {
+		cfg.Hunter.StopLossPct = 50
+	}
+	if cfg.Hunter.TrailingStopPct == 0 {
+		cfg.Hunter.TrailingStopPct = 20
+	}
+	if cfg.Hunter.MaxPositions == 0 {
+		cfg.Hunter.MaxPositions = 5
+	}
+	if cfg.Hunter.MaxDailyLossSOL == 0 {
+		cfg.Hunter.MaxDailyLossSOL = 1.0
+	}
+	if cfg.Hunter.MaxDailySpendSOL == 0 {
+		cfg.Hunter.MaxDailySpendSOL = 2.0
+	}
+	if cfg.Hunter.MinSafetyScore == 0 {
+		cfg.Hunter.MinSafetyScore = 40
+	}
+	if cfg.Hunter.MinLiquidityUSD == 0 {
+		cfg.Hunter.MinLiquidityUSD = 500
+	}
+	if cfg.Hunter.MaxTokenAgeMinutes == 0 {
+		cfg.Hunter.MaxTokenAgeMinutes = 30
 	}
 }
