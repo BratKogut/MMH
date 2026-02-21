@@ -14,11 +14,13 @@ import (
 
 	"github.com/nexus-trading/nexus/internal/adapters/jupiter"
 	"github.com/nexus-trading/nexus/internal/config"
+	"github.com/nexus-trading/nexus/internal/graph"
 	"github.com/nexus-trading/nexus/internal/scanner"
 	"github.com/nexus-trading/nexus/internal/sniper"
 	"github.com/nexus-trading/nexus/internal/solana"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/shopspring/decimal"
 )
 
 func main() {
@@ -100,6 +102,29 @@ func main() {
 	}
 	analyzer := scanner.NewAnalyzer(analyzerConfig, rpc)
 
+	// 6b. Create Entity Graph Engine.
+	graphConfig := graph.DefaultConfig()
+	entityGraph := graph.NewEngine(graphConfig)
+	log.Info().
+		Int("max_nodes", graphConfig.MaxNodes).
+		Int("label_depth", graphConfig.LabelPropDepth).
+		Msg("Entity Graph Engine initialized")
+
+	// 6c. Create Sell Simulator.
+	sellSimulator := scanner.NewSellSimulator(rpc)
+	log.Info().Msg("Sell Simulator initialized")
+
+	// 6d. Create 5D Scorer.
+	scoringConfig := scanner.DefaultScoringConfig()
+	scorer := scanner.NewScorer(scoringConfig)
+	log.Info().
+		Float64("safety_w", scoringConfig.Weights.Safety).
+		Float64("entity_w", scoringConfig.Weights.Entity).
+		Float64("social_w", scoringConfig.Weights.Social).
+		Float64("onchain_w", scoringConfig.Weights.OnChain).
+		Float64("timing_w", scoringConfig.Weights.Timing).
+		Msg("5D Scorer initialized")
+
 	// 7. Create Sniper Engine.
 	sniperConfig := sniper.Config{
 		MaxBuySOL:            cfg.Hunter.MaxBuySOL,
@@ -117,6 +142,13 @@ func main() {
 		DryRun:               dryRun,
 	}
 	sniperEngine := sniper.NewEngine(sniperConfig, jupAdapter, rpc)
+
+	// Configure multi-level TP exit engine.
+	exitConfig := sniper.DefaultExitConfig()
+	exitConfig.StopLossPct = cfg.Hunter.StopLossPct
+	exitConfig.TrailingStopEnabled = cfg.Hunter.TrailingStopEnabled
+	exitConfig.TrailingStopPct = cfg.Hunter.TrailingStopPct
+	sniperEngine.SetExitConfig(exitConfig)
 
 	// Wire position callbacks.
 	sniperEngine.SetOnPositionOpen(func(pos *sniper.Position) {
@@ -147,7 +179,7 @@ func main() {
 		MinQuoteReserveSOL: 1.0,
 	}
 
-	// Scanner -> Analyzer -> Sniper pipeline.
+	// Scanner -> Analyzer -> 5D Scorer -> Sniper pipeline.
 	tokenScanner := scanner.NewScanner(scannerConfig, rpc, func(ctx context.Context, discovery scanner.PoolDiscovery) {
 		log.Info().
 			Str("pool", string(discovery.Pool.PoolAddress)).
@@ -156,14 +188,74 @@ func main() {
 			Int64("latency_ms", discovery.LatencyMs).
 			Msg("[NEW POOL] Analyzing...")
 
-		// Analyze the token.
+		// Stage 1: Safety analysis.
 		analysis := analyzer.Analyze(ctx, discovery)
 
 		log.Info().
 			Str("mint", string(analysis.Mint)).
 			Int("safety_score", analysis.SafetyScore).
 			Str("verdict", string(analysis.Verdict)).
-			Msg("[ANALYSIS] Result")
+			Msg("[ANALYSIS] Safety result")
+
+		// Stage 2: Pre-buy sell simulation.
+		preBuySim := sellSimulator.SimulatePreBuy(ctx,
+			decimal.NewFromFloat(cfg.Hunter.MaxBuySOL), discovery.Pool)
+
+		log.Info().
+			Str("mint", string(analysis.Mint)).
+			Bool("can_sell", preBuySim.CanSell).
+			Float64("tax_pct", preBuySim.EstimatedTaxPct).
+			Msg("[SELLSIM] Pre-buy result")
+
+		// Stage 3: Entity graph query.
+		var entityReport *graph.EntityReport
+		if discovery.Pool.TokenMint != "" {
+			report := entityGraph.QueryDeployer(string(discovery.Pool.TokenMint))
+			entityReport = &report
+			log.Debug().
+				Str("mint", string(analysis.Mint)).
+				Float64("risk", report.RiskScore).
+				Int("hops_rugger", report.HopsToRugger).
+				Msg("[ENTITY] Deployer report")
+		}
+
+		// Stage 4: 5-Dimensional scoring.
+		scoringInput := scanner.ScoringInput{
+			Analysis:     analysis,
+			EntityReport: entityReport,
+			SellSim:      &preBuySim,
+		}
+		tokenScore := scorer.Score(scoringInput)
+
+		log.Info().
+			Str("mint", string(analysis.Mint)).
+			Float64("total", tokenScore.Total).
+			Float64("safety", tokenScore.Safety).
+			Float64("entity", tokenScore.Entity).
+			Float64("social", tokenScore.Social).
+			Float64("onchain", tokenScore.OnChain).
+			Float64("timing", tokenScore.Timing).
+			Str("recommendation", tokenScore.Recommendation).
+			Str("correlation", tokenScore.CorrelationType).
+			Bool("instant_kill", tokenScore.InstantKill).
+			Msg("[5D SCORE] Result")
+
+		// Stage 5: Apply 5D score to sniper decision.
+		if tokenScore.InstantKill {
+			log.Warn().
+				Str("mint", string(analysis.Mint)).
+				Str("kill_reason", tokenScore.KillReason).
+				Msg("[SKIP] Instant kill")
+			return
+		}
+
+		if tokenScore.Recommendation == "SKIP" || tokenScore.Recommendation == "WAIT" {
+			log.Info().
+				Str("mint", string(analysis.Mint)).
+				Str("recommendation", tokenScore.Recommendation).
+				Msg("[SKIP] Score too low")
+			return
+		}
 
 		// Feed to sniper for buy decision.
 		sniperEngine.OnDiscovery(ctx, analysis)
@@ -208,11 +300,13 @@ func main() {
 			sniperStats := sniperEngine.Stats()
 			scannerStats := tokenScanner.Stats()
 			jupStats := jupAdapter.Stats()
+			graphStats := entityGraph.Stats()
 
 			combined := map[string]any{
 				"sniper":  sniperStats,
 				"scanner": scannerStats,
 				"jupiter": jupStats,
+				"graph":   graphStats,
 				"dry_run": dryRun,
 			}
 

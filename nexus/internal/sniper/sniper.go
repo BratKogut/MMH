@@ -119,7 +119,13 @@ type Engine struct {
 
 	mu        sync.RWMutex
 	positions map[string]*Position // ID -> Position
+	trackers  map[string]*ExitTracker // ID -> ExitTracker
 	running   atomic.Bool
+
+	// Sub-engines.
+	exitEngine *ExitEngine
+	sellSim    *scanner.SellSimulator
+	csmConfig  CSMConfig
 
 	// Daily budget tracking.
 	dailySpentSOL   decimal.Decimal
@@ -145,8 +151,26 @@ func NewEngine(config Config, jup *jupiter.Adapter, rpc solana.RPCClient) *Engin
 		jupiter:        jup,
 		rpc:            rpc,
 		positions:      make(map[string]*Position),
+		trackers:       make(map[string]*ExitTracker),
+		exitEngine:     NewExitEngine(DefaultExitConfig()),
+		sellSim:        scanner.NewSellSimulator(rpc),
+		csmConfig:      DefaultCSMConfig(),
 		dailyResetTime: startOfDay(),
 	}
+}
+
+// SetExitConfig sets the exit configuration.
+func (e *Engine) SetExitConfig(config ExitConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.exitEngine = NewExitEngine(config)
+}
+
+// SetCSMConfig sets the CSM configuration.
+func (e *Engine) SetCSMConfig(config CSMConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.csmConfig = config
 }
 
 // SetOnPositionOpen sets callback for new positions.
@@ -265,13 +289,22 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		pos.AmountToken = result.AmountOut
 	}
 
-	// Track spending.
+	// Track spending + create exit tracker.
 	e.mu.Lock()
 	e.positions[posID] = pos
+	e.trackers[posID] = NewExitTracker(posID, pos.AmountToken, e.exitEngine.config)
 	e.dailySpentSOL = e.dailySpentSOL.Add(buyAmount)
+	csmCfg := e.csmConfig
 	e.mu.Unlock()
 
 	e.totalSnipes.Add(1)
+
+	// Start CSM for this position.
+	csm := NewCSM(csmCfg, pos, e.sellSim, e.rpc, analysis.Pool.LiquidityUSD,
+		func(ctx context.Context, p *Position, reason string) {
+			e.executeSell(ctx, p, reason)
+		})
+	go csm.Run(context.Background())
 
 	// Notify callback.
 	e.mu.RLock()
@@ -313,7 +346,23 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			pos.PnLPct, _ = pnl.Float64()
 		}
 
-		// Check take profit.
+		// Use ExitEngine for multi-level TP/SL/trailing/timed decisions.
+		tracker := e.trackers[pos.ID]
+		if tracker != nil && e.exitEngine != nil {
+			decision := e.exitEngine.Evaluate(pos, tracker)
+			if decision.ShouldSell {
+				e.exitEngine.ApplyDecision(tracker, decision)
+				if decision.IsFullClose {
+					go e.executeSell(ctx, pos, decision.Reason)
+				} else {
+					go e.executePartialSell(ctx, pos, decision)
+				}
+				return
+			}
+			continue
+		}
+
+		// Fallback: simple TP/SL for backward compat (when no exit engine).
 		if e.config.TakeProfitMultiplier > 0 {
 			tpPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(e.config.TakeProfitMultiplier))
 			if priceUSD.GreaterThanOrEqual(tpPrice) {
@@ -322,7 +371,6 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			}
 		}
 
-		// Check trailing stop.
 		if e.config.TrailingStopEnabled && pos.HighestPrice.IsPositive() {
 			trailDist := pos.HighestPrice.Mul(decimal.NewFromFloat(e.config.TrailingStopPct / 100.0))
 			trailStop := pos.HighestPrice.Sub(trailDist)
@@ -332,7 +380,6 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			}
 		}
 
-		// Check stop loss.
 		if e.config.StopLossPct > 0 {
 			slPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(1.0 - e.config.StopLossPct/100.0))
 			if priceUSD.LessThanOrEqual(slPrice) {
@@ -341,7 +388,6 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			}
 		}
 
-		// Check auto-sell timeout.
 		if e.config.AutoSellAfterMinutes > 0 {
 			maxAge := time.Duration(e.config.AutoSellAfterMinutes) * time.Minute
 			if time.Since(pos.OpenedAt) > maxAge {
@@ -350,6 +396,51 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			}
 		}
 	}
+}
+
+// executePartialSell sells a partial amount of a position.
+func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision ExitDecision) {
+	log.Info().
+		Str("pos_id", pos.ID).
+		Str("mint", string(pos.TokenMint)).
+		Str("reason", decision.Reason).
+		Float64("sell_pct", decision.SellPct).
+		Str("sell_amount", decision.SellAmount.String()).
+		Msg("sniper: PARTIAL SELL")
+
+	if e.config.DryRun {
+		log.Info().
+			Str("pos_id", pos.ID).
+			Str("reason", decision.Reason).
+			Float64("sell_pct", decision.SellPct).
+			Msg("sniper: DRY RUN partial sell")
+	} else {
+		params := solana.SwapParams{
+			InputMint:   pos.TokenMint,
+			OutputMint:  solana.SOLMint,
+			AmountIn:    decision.SellAmount,
+			SlippageBps: e.config.SlippageBps,
+			PriorityFee: 100_000,
+		}
+
+		_, err := e.jupiter.SwapDirect(ctx, params)
+		if err != nil {
+			log.Error().Err(err).Str("pos_id", pos.ID).Msg("sniper: partial sell FAILED")
+			return
+		}
+	}
+
+	// Update position token amount.
+	e.mu.Lock()
+	pos.AmountToken = pos.AmountToken.Sub(decision.SellAmount)
+	e.mu.Unlock()
+
+	e.totalSells.Add(1)
+
+	log.Info().
+		Str("pos_id", pos.ID).
+		Str("remaining", pos.AmountToken.String()).
+		Msg("sniper: partial sell completed")
 }
 
 // executeSell closes a position.

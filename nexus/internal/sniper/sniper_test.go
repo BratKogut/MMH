@@ -157,15 +157,19 @@ func TestSniper_TakeProfit(t *testing.T) {
 
 	require.Len(t, engine.OpenPositions(), 1)
 
-	// Price doubles → take profit at 2x.
-	engine.UpdatePrice(ctx, solana.Pubkey("tp-token"), decimal.NewFromFloat(0.002))
+	// Multi-level TP: cycle through all levels at 6x price.
+	// Each UpdatePrice triggers one TP level sequentially.
+	for i := 0; i < 4; i++ {
+		engine.UpdatePrice(ctx, solana.Pubkey("tp-token"), decimal.NewFromFloat(0.006))
+		time.Sleep(20 * time.Millisecond)
+	}
 
-	// Give goroutine time to execute sell.
+	// L4 should trigger full close.
 	time.Sleep(50 * time.Millisecond)
 
 	mu.Lock()
-	require.Len(t, closed, 1)
-	assert.Equal(t, "TAKE_PROFIT", closed[0].CloseReason)
+	require.Len(t, closed, 1, "L4 full close should fire")
+	assert.Equal(t, "TAKE_PROFIT_L4", closed[0].CloseReason)
 	mu.Unlock()
 }
 

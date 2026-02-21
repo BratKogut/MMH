@@ -80,6 +80,7 @@ type StubRPCClient struct {
 	swapResults    []SwapResult
 	swapCallCount  int
 	failNext       bool
+	sendError      bool // persistent send error flag
 }
 
 // NewStubRPCClient creates a stub RPC client for testing.
@@ -134,6 +135,13 @@ func (s *StubRPCClient) SetFailNext() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failNext = true
+}
+
+// SetSendError enables/disables persistent SendTransaction errors.
+func (s *StubRPCClient) SetSendError(fail bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendError = fail
 }
 
 func (s *StubRPCClient) shouldFail() bool {
@@ -210,6 +218,12 @@ func (s *StubRPCClient) GetPoolInfo(_ context.Context, poolAddress Pubkey) (*Poo
 func (s *StubRPCClient) SendTransaction(_ context.Context, _ string) (Signature, error) {
 	if s.shouldFail() {
 		return "", fmt.Errorf("stub: simulated RPC failure")
+	}
+	s.mu.RLock()
+	sendErr := s.sendError
+	s.mu.RUnlock()
+	if sendErr {
+		return "", fmt.Errorf("stub: simulated send failure")
 	}
 	return Signature(fmt.Sprintf("stub-sig-%d", time.Now().UnixNano())), nil
 }
