@@ -171,7 +171,7 @@ func (c *JitoClient) SendBundle(ctx context.Context, transactions []string) (*Bu
 	}
 
 	c.bundlesSent.Add(1)
-	tipLamports := c.config.TipSOL.Mul(decimal.NewFromInt(1_000_000_000)).IntPart()
+	tipLamports := c.config.TipSOL.Mul(decimal.NewFromInt(1_000_000_000)).Round(0).IntPart()
 	c.totalTipSOL.Add(tipLamports)
 
 	log.Info().
@@ -240,13 +240,12 @@ func (c *JitoClient) GetBundleStatus(ctx context.Context, bundleID string) (*Bun
 
 	entry := statusResp.Result.Value[0]
 	status := "pending"
-	if entry.ConfirmationStatus == "confirmed" || entry.ConfirmationStatus == "finalized" {
-		status = "landed"
-		c.bundlesLanded.Add(1)
-	}
 	if entry.Err != nil {
 		status = "failed"
 		c.bundlesFailed.Add(1)
+	} else if entry.ConfirmationStatus == "confirmed" || entry.ConfirmationStatus == "finalized" {
+		status = "landed"
+		c.bundlesLanded.Add(1)
 	}
 
 	return &BundleStatus{
@@ -270,7 +269,7 @@ func (c *JitoClient) NextTipAccount() Pubkey {
 		Pubkey(jitoTipAccount8),
 	}
 	idx := c.tipAcctIdx.Add(1) - 1
-	return accounts[idx%uint32(len(accounts))]
+	return accounts[idx%uint32(len(accounts))] //nolint: overflow wraps safely for modulo
 }
 
 // JitoStats returns Jito client statistics.

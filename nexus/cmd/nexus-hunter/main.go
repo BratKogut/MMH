@@ -59,17 +59,38 @@ func main() {
 		Float64("min_liquidity", cfg.Hunter.MinLiquidityUSD).
 		Msg("Configuration loaded")
 
+	// 3b. Validate configuration.
+	if err := cfg.Validate(); err != nil {
+		log.Fatal().Err(err).Msg("Configuration validation failed")
+	}
+
 	// 4. Create Solana RPC client.
 	var rpc solana.RPCClient
 	if *stubMode {
 		rpc = solana.NewStubRPCClient()
 		log.Info().Msg("Solana RPC: STUB mode")
 	} else {
-		// TODO: Create live RPC client when Solana SDK is integrated.
-		rpc = solana.NewStubRPCClient()
-		log.Info().
-			Str("endpoint", cfg.Solana.RPCEndpoint).
-			Msg("Solana RPC: STUB (live RPC integration pending)")
+		rpcConfig := solana.RPCConfig{
+			Endpoint:     cfg.Solana.RPCEndpoint,
+			WSEndpoint:   cfg.Solana.WSEndpoint,
+			Timeout:      10 * time.Second,
+			MaxRetries:   3,
+			RateLimitRPS: cfg.Solana.RateLimitRPS,
+			PrivateKey:   cfg.Solana.PrivateKey,
+		}
+		liveRPC := solana.NewLiveRPCClient(rpcConfig)
+		rpc = liveRPC
+		defer liveRPC.Close()
+
+		// Verify RPC connectivity.
+		healthCtx, healthCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := rpc.Health(healthCtx); err != nil {
+			log.Warn().Err(err).Str("endpoint", cfg.Solana.RPCEndpoint).
+				Msg("Solana RPC health check failed (continuing, may be rate-limited)")
+		} else {
+			log.Info().Str("endpoint", cfg.Solana.RPCEndpoint).Msg("Solana RPC: LIVE - connected")
+		}
+		healthCancel()
 	}
 
 	// 5. Create Jupiter adapter.
@@ -82,7 +103,12 @@ func main() {
 		UseJito:        cfg.Hunter.UseJito,
 		JitoTipSOL:     cfg.Hunter.JitoTipSOL,
 	}
-	wallet := solana.Pubkey("HUNTER-WALLET") // placeholder until real wallet
+	// Derive wallet pubkey from config.
+	walletPub := cfg.Solana.WalletPubkey
+	if walletPub == "" && dryRun {
+		walletPub = "DRY-RUN-WALLET"
+	}
+	wallet := solana.Pubkey(walletPub)
 	jupAdapter := jupiter.New(jupConfig, rpc, wallet)
 
 	if err := jupAdapter.Connect(context.Background()); err != nil {
@@ -384,8 +410,10 @@ func main() {
 	// 12. Graceful shutdown.
 	log.Info().Msg("Shutting down Hunter...")
 
-	// Force close all open positions.
-	sniperEngine.ForceClose(context.Background())
+	// Force close all open positions with timeout.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	sniperEngine.ForceClose(shutdownCtx)
+	shutdownCancel()
 
 	jupAdapter.Disconnect()
 	wg.Wait()

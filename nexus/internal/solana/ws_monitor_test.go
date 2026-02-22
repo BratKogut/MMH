@@ -1,6 +1,7 @@
 package solana
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,12 +92,12 @@ func TestWSMonitorConfig_Defaults(t *testing.T) {
 	assert.Len(t, config.ProgramIDs, 2)
 	assert.Equal(t, 1000, config.ReconnectDelayMs)
 	assert.Equal(t, 30, config.PingIntervalS)
-	assert.Equal(t, 100, config.MaxReconnects)
+	assert.Equal(t, 0, config.MaxReconnects) // 0 = unlimited reconnects
 }
 
-func TestContains(t *testing.T) {
-	assert.True(t, contains("hello world", "world"))
-	assert.True(t, contains("hello world", "hello"))
-	assert.False(t, contains("hello", "world"))
-	assert.False(t, contains("hi", "hello"))
+func TestStringContains(t *testing.T) {
+	assert.True(t, strings.Contains("hello world", "world"))
+	assert.True(t, strings.Contains("hello world", "hello"))
+	assert.False(t, strings.Contains("hello", "world"))
+	assert.False(t, strings.Contains("hi", "hello"))
 }

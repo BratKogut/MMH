@@ -179,16 +179,12 @@ func (s *Scanner) pollDEX(ctx context.Context, dex string) {
 func (s *Scanner) handlePool(ctx context.Context, pool solana.PoolInfo, source string) {
 	s.poolsScanned.Add(1)
 
-	// Dedup: skip if already seen.
-	s.mu.RLock()
-	_, seen := s.seenPools[pool.PoolAddress]
-	s.mu.RUnlock()
-	if seen {
+	// Atomic check-and-insert under single write lock to prevent race.
+	s.mu.Lock()
+	if _, seen := s.seenPools[pool.PoolAddress]; seen {
+		s.mu.Unlock()
 		return
 	}
-
-	// Mark as seen.
-	s.mu.Lock()
 	if len(s.seenPools) >= s.config.MaxTrackedPools {
 		// Evict oldest entry.
 		var oldestKey solana.Pubkey
@@ -261,7 +257,15 @@ func (s *Scanner) handlePool(ctx context.Context, pool solana.PoolInfo, source s
 		Msg("scanner: NEW POOL DISCOVERED")
 
 	if s.onDisc != nil {
-		s.onDisc(ctx, discovery)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Str("pool", string(pool.PoolAddress)).
+						Msg("scanner: discovery callback panic recovered")
+				}
+			}()
+			s.onDisc(ctx, discovery)
+		}()
 	}
 }
 
@@ -278,13 +282,23 @@ func (s *Scanner) cleanupLoop(ctx context.Context) {
 			maxAge := time.Duration(s.config.MaxTokenAgeMinutes*2) * time.Minute
 			cutoff := time.Now().Add(-maxAge)
 
-			s.mu.Lock()
+			// Collect keys to delete first, then delete (safe map iteration).
+			s.mu.RLock()
+			var toDelete []solana.Pubkey
 			for k, v := range s.seenPools {
 				if v.Before(cutoff) {
-					delete(s.seenPools, k)
+					toDelete = append(toDelete, k)
 				}
 			}
-			s.mu.Unlock()
+			s.mu.RUnlock()
+
+			if len(toDelete) > 0 {
+				s.mu.Lock()
+				for _, k := range toDelete {
+					delete(s.seenPools, k)
+				}
+				s.mu.Unlock()
+			}
 		}
 	}
 }

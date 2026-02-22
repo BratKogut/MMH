@@ -21,84 +21,66 @@ import (
 
 // Config configures the sniper engine.
 type Config struct {
-	// Maximum SOL to spend per snipe.
-	MaxBuySOL float64 `yaml:"max_buy_sol"`
-
-	// Default slippage tolerance in bps.
-	SlippageBps int `yaml:"slippage_bps"`
-
-	// Take profit target (multiplier). 2.0 = 2x = 100% gain.
+	MaxBuySOL            float64 `yaml:"max_buy_sol"`
+	SlippageBps          int     `yaml:"slippage_bps"`
 	TakeProfitMultiplier float64 `yaml:"take_profit_multiplier"`
-
-	// Stop loss percentage (0-100). 50 = sell if price drops 50%.
-	StopLossPct float64 `yaml:"stop_loss_pct"`
-
-	// Enable trailing stop loss.
-	TrailingStopEnabled bool `yaml:"trailing_stop_enabled"`
-
-	// Trailing stop distance in percentage.
-	TrailingStopPct float64 `yaml:"trailing_stop_pct"`
-
-	// Maximum concurrent positions.
-	MaxPositions int `yaml:"max_positions"`
-
-	// Maximum daily loss in SOL before stopping.
-	MaxDailyLossSOL float64 `yaml:"max_daily_loss_sol"`
-
-	// Maximum daily spend in SOL.
-	MaxDailySpendSOL float64 `yaml:"max_daily_spend_sol"`
-
-	// Price check interval for TP/SL monitoring.
-	PriceCheckIntervalMs int `yaml:"price_check_interval_ms"`
-
-	// Minimum analyzer safety score to auto-snipe.
-	MinSafetyScore int `yaml:"min_safety_score"`
-
-	// Auto-sell after this duration if no TP/SL hit (0 = disabled).
-	AutoSellAfterMinutes int `yaml:"auto_sell_after_minutes"`
-
-	// Dry run mode - log but don't execute.
-	DryRun bool `yaml:"dry_run"`
+	StopLossPct          float64 `yaml:"stop_loss_pct"`
+	TrailingStopEnabled  bool    `yaml:"trailing_stop_enabled"`
+	TrailingStopPct      float64 `yaml:"trailing_stop_pct"`
+	MaxPositions         int     `yaml:"max_positions"`
+	MaxDailyLossSOL      float64 `yaml:"max_daily_loss_sol"`
+	MaxDailySpendSOL     float64 `yaml:"max_daily_spend_sol"`
+	PriceCheckIntervalMs int     `yaml:"price_check_interval_ms"`
+	MinSafetyScore       int     `yaml:"min_safety_score"`
+	AutoSellAfterMinutes int     `yaml:"auto_sell_after_minutes"`
+	DryRun               bool    `yaml:"dry_run"`
+	PriorityFee          uint64  `yaml:"priority_fee"`
+	UseJito              bool    `yaml:"use_jito"`
+	MaxSellRetries       int     `yaml:"max_sell_retries"`
 }
 
 // DefaultConfig returns conservative defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxBuySOL:            0.1,   // 0.1 SOL per snipe
-		SlippageBps:          200,   // 2%
-		TakeProfitMultiplier: 2.0,   // 2x target
-		StopLossPct:          50,    // -50% stop loss
+		MaxBuySOL:            0.1,
+		SlippageBps:          200,
+		TakeProfitMultiplier: 2.0,
+		StopLossPct:          50,
 		TrailingStopEnabled:  true,
-		TrailingStopPct:      20,    // 20% trailing stop
+		TrailingStopPct:      20,
 		MaxPositions:         5,
 		MaxDailyLossSOL:      1.0,
 		MaxDailySpendSOL:     2.0,
-		PriceCheckIntervalMs: 3000,  // Check every 3s
+		PriceCheckIntervalMs: 3000,
 		MinSafetyScore:       40,
-		AutoSellAfterMinutes: 60,    // Auto-sell after 1 hour
-		DryRun:               true,  // Default to dry run
+		AutoSellAfterMinutes: 60,
+		DryRun:               true,
+		PriorityFee:          100_000,
+		UseJito:              false,
+		MaxSellRetries:       3,
 	}
 }
 
 // Position tracks an active snipe position.
 type Position struct {
-	ID             string          `json:"id"`
-	TokenMint      solana.Pubkey   `json:"token_mint"`
-	PoolAddress    solana.Pubkey   `json:"pool_address"`
-	DEX            string          `json:"dex"`
-	EntryPriceUSD  decimal.Decimal `json:"entry_price_usd"`
-	AmountToken    decimal.Decimal `json:"amount_token"`
-	CostSOL        decimal.Decimal `json:"cost_sol"`
-	CurrentPrice   decimal.Decimal `json:"current_price_usd"`
-	HighestPrice   decimal.Decimal `json:"highest_price_usd"` // for trailing stop
-	PnLPct         float64         `json:"pnl_pct"`
-	SafetyScore    int             `json:"safety_score"`
-	BuySignature   solana.Signature `json:"buy_signature"`
-	SellSignature  solana.Signature `json:"sell_signature,omitempty"`
-	Status         PositionStatus  `json:"status"`
-	OpenedAt       time.Time       `json:"opened_at"`
-	ClosedAt       *time.Time      `json:"closed_at,omitempty"`
-	CloseReason    string          `json:"close_reason,omitempty"`
+	ID            string           `json:"id"`
+	TokenMint     solana.Pubkey    `json:"token_mint"`
+	PoolAddress   solana.Pubkey    `json:"pool_address"`
+	DEX           string           `json:"dex"`
+	EntryPriceUSD decimal.Decimal  `json:"entry_price_usd"`
+	AmountToken   decimal.Decimal  `json:"amount_token"`
+	CostSOL       decimal.Decimal  `json:"cost_sol"`
+	CurrentPrice  decimal.Decimal  `json:"current_price_usd"`
+	HighestPrice  decimal.Decimal  `json:"highest_price_usd"`
+	PnLPct        float64          `json:"pnl_pct"`
+	SafetyScore   int              `json:"safety_score"`
+	BuySignature  solana.Signature `json:"buy_signature"`
+	SellSignature solana.Signature `json:"sell_signature,omitempty"`
+	Status        PositionStatus   `json:"status"`
+	OpenedAt      time.Time        `json:"opened_at"`
+	ClosedAt      *time.Time       `json:"closed_at,omitempty"`
+	CloseReason   string           `json:"close_reason,omitempty"`
+	SellRetries   int              `json:"sell_retries"`
 }
 
 // PositionStatus represents the state of a snipe position.
@@ -113,13 +95,14 @@ const (
 
 // Engine is the sniper engine that manages buy/sell decisions and positions.
 type Engine struct {
-	config   Config
-	jupiter  *jupiter.Adapter
-	rpc      solana.RPCClient
+	config  Config
+	jupiter *jupiter.Adapter
+	rpc     solana.RPCClient
 
 	mu        sync.RWMutex
-	positions map[string]*Position // ID -> Position
-	trackers  map[string]*ExitTracker // ID -> ExitTracker
+	positions map[string]*Position
+	trackers  map[string]*ExitTracker
+	csmCancel map[string]context.CancelFunc // per-position CSM cancel
 	running   atomic.Bool
 
 	// Sub-engines.
@@ -127,15 +110,15 @@ type Engine struct {
 	sellSim    *scanner.SellSimulator
 	csmConfig  CSMConfig
 
-	// Daily budget tracking.
-	dailySpentSOL   decimal.Decimal
-	dailyLossSOL    decimal.Decimal
-	dailyResetTime  time.Time
+	// Daily budget tracking (protected by mu).
+	dailySpentSOL  decimal.Decimal
+	dailyLossSOL   decimal.Decimal
+	dailyResetTime time.Time
 
 	// Stats.
 	totalSnipes    atomic.Int64
 	totalSells     atomic.Int64
-	totalProfitSOL atomic.Int64 // stored as micro-SOL for atomic
+	totalProfitSOL atomic.Int64
 	winCount       atomic.Int64
 	lossCount      atomic.Int64
 
@@ -146,12 +129,19 @@ type Engine struct {
 
 // NewEngine creates a new sniper engine.
 func NewEngine(config Config, jup *jupiter.Adapter, rpc solana.RPCClient) *Engine {
+	if config.MaxSellRetries <= 0 {
+		config.MaxSellRetries = 3
+	}
+	if config.PriorityFee == 0 {
+		config.PriorityFee = 100_000
+	}
 	return &Engine{
 		config:         config,
 		jupiter:        jup,
 		rpc:            rpc,
 		positions:      make(map[string]*Position),
 		trackers:       make(map[string]*ExitTracker),
+		csmCancel:      make(map[string]context.CancelFunc),
 		exitEngine:     NewExitEngine(DefaultExitConfig()),
 		sellSim:        scanner.NewSellSimulator(rpc),
 		csmConfig:      DefaultCSMConfig(),
@@ -189,8 +179,8 @@ func (e *Engine) SetOnPositionClose(fn func(pos *Position)) {
 
 // OnDiscovery is the callback for the scanner. Decides whether to snipe a new token.
 func (e *Engine) OnDiscovery(ctx context.Context, analysis scanner.TokenAnalysis) {
-	// Check daily limits.
-	if !e.checkDailyLimits() {
+	// Atomic check-and-reserve daily budget.
+	if !e.reserveDailyBudget() {
 		log.Warn().Msg("sniper: daily limit reached, skipping")
 		return
 	}
@@ -211,7 +201,6 @@ func (e *Engine) OnDiscovery(ctx context.Context, analysis scanner.TokenAnalysis
 		return
 	}
 
-	// Check safety score.
 	if analysis.SafetyScore < e.config.MinSafetyScore {
 		log.Info().
 			Int("score", analysis.SafetyScore).
@@ -221,7 +210,6 @@ func (e *Engine) OnDiscovery(ctx context.Context, analysis scanner.TokenAnalysis
 		return
 	}
 
-	// Check verdict.
 	if analysis.Verdict != scanner.VerdictBuy {
 		log.Info().
 			Str("verdict", string(analysis.Verdict)).
@@ -229,7 +217,6 @@ func (e *Engine) OnDiscovery(ctx context.Context, analysis scanner.TokenAnalysis
 		return
 	}
 
-	// Execute the snipe.
 	e.executeBuy(ctx, analysis)
 }
 
@@ -263,7 +250,11 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 
 	if e.config.DryRun {
 		pos.BuySignature = solana.Signature(fmt.Sprintf("DRYRUN-BUY-%s", posID))
-		pos.AmountToken = buyAmount.Div(analysis.Pool.PriceUSD)
+		if analysis.Pool.PriceUSD.IsPositive() {
+			pos.AmountToken = buyAmount.Div(analysis.Pool.PriceUSD)
+		} else {
+			pos.AmountToken = buyAmount
+		}
 		log.Info().
 			Str("pos_id", posID).
 			Str("token_amount", pos.AmountToken.String()).
@@ -274,14 +265,15 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 			OutputMint:    analysis.Mint,
 			AmountIn:      buyAmount,
 			SlippageBps:   e.config.SlippageBps,
-			PriorityFee:   100_000,
-			UseJitoBundle: false,
+			PriorityFee:   e.config.PriorityFee,
+			UseJitoBundle: e.config.UseJito,
 		}
 
 		result, err := e.jupiter.SwapDirect(ctx, params)
 		if err != nil {
-			log.Error().Err(err).Str("pos_id", posID).Msg("sniper: buy FAILED")
+			log.Error().Err(err).Str("pos_id", posID).Str("mint", string(analysis.Mint)).Msg("sniper: buy FAILED")
 			pos.Status = StatusFailed
+			// Don't track failed buy positions.
 			return
 		}
 
@@ -289,7 +281,7 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		pos.AmountToken = result.AmountOut
 	}
 
-	// Track spending + create exit tracker.
+	// Track spending + create exit tracker under single lock.
 	e.mu.Lock()
 	e.positions[posID] = pos
 	e.trackers[posID] = NewExitTracker(posID, pos.AmountToken, e.exitEngine.config)
@@ -299,12 +291,24 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 
 	e.totalSnipes.Add(1)
 
-	// Start CSM for this position.
+	// Start CSM with cancellable context.
+	csmCtx, csmCancel := context.WithCancel(ctx)
+	e.mu.Lock()
+	e.csmCancel[posID] = csmCancel
+	e.mu.Unlock()
+
 	csm := NewCSM(csmCfg, pos, e.sellSim, e.rpc, analysis.Pool.LiquidityUSD,
-		func(ctx context.Context, p *Position, reason string) {
-			e.executeSell(ctx, p, reason)
+		func(csmCtx context.Context, p *Position, reason string) {
+			e.executeSell(csmCtx, p, reason)
 		})
-	go csm.Run(context.Background())
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Interface("panic", r).Str("pos_id", posID).Msg("sniper: CSM panic recovered")
+			}
+		}()
+		csm.Run(csmCtx)
+	}()
 
 	// Notify callback.
 	e.mu.RLock()
@@ -334,12 +338,10 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 
 		pos.CurrentPrice = priceUSD
 
-		// Track highest price for trailing stop.
 		if priceUSD.GreaterThan(pos.HighestPrice) {
 			pos.HighestPrice = priceUSD
 		}
 
-		// Calculate PnL.
 		if pos.EntryPriceUSD.IsPositive() {
 			pnl := priceUSD.Sub(pos.EntryPriceUSD).Div(pos.EntryPriceUSD).
 				Mul(decimal.NewFromInt(100))
@@ -352,20 +354,39 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			decision := e.exitEngine.Evaluate(pos, tracker)
 			if decision.ShouldSell {
 				e.exitEngine.ApplyDecision(tracker, decision)
+				// Mark as closing BEFORE spawning goroutine to prevent double-sell.
+				pos.Status = StatusClosing
 				if decision.IsFullClose {
-					go e.executeSell(ctx, pos, decision.Reason)
+					go func(p *Position, r string) {
+						defer func() {
+							if rec := recover(); rec != nil {
+								log.Error().Interface("panic", rec).Str("pos_id", p.ID).Msg("sniper: sell panic recovered")
+							}
+						}()
+						e.executeSell(ctx, p, r)
+					}(pos, decision.Reason)
 				} else {
-					go e.executePartialSell(ctx, pos, decision)
+					// For partial sells, don't change status to closing.
+					pos.Status = StatusOpen
+					go func(p *Position, d ExitDecision) {
+						defer func() {
+							if rec := recover(); rec != nil {
+								log.Error().Interface("panic", rec).Str("pos_id", p.ID).Msg("sniper: partial sell panic recovered")
+							}
+						}()
+						e.executePartialSell(ctx, p, d)
+					}(pos, decision)
 				}
 				return
 			}
 			continue
 		}
 
-		// Fallback: simple TP/SL for backward compat (when no exit engine).
+		// Fallback: simple TP/SL (when no exit engine).
 		if e.config.TakeProfitMultiplier > 0 {
 			tpPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(e.config.TakeProfitMultiplier))
 			if priceUSD.GreaterThanOrEqual(tpPrice) {
+				pos.Status = StatusClosing
 				go e.executeSell(ctx, pos, "TAKE_PROFIT")
 				return
 			}
@@ -375,6 +396,7 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			trailDist := pos.HighestPrice.Mul(decimal.NewFromFloat(e.config.TrailingStopPct / 100.0))
 			trailStop := pos.HighestPrice.Sub(trailDist)
 			if priceUSD.LessThanOrEqual(trailStop) && priceUSD.GreaterThan(pos.EntryPriceUSD) {
+				pos.Status = StatusClosing
 				go e.executeSell(ctx, pos, "TRAILING_STOP")
 				return
 			}
@@ -383,6 +405,7 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 		if e.config.StopLossPct > 0 {
 			slPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(1.0 - e.config.StopLossPct/100.0))
 			if priceUSD.LessThanOrEqual(slPrice) {
+				pos.Status = StatusClosing
 				go e.executeSell(ctx, pos, "STOP_LOSS")
 				return
 			}
@@ -391,6 +414,7 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 		if e.config.AutoSellAfterMinutes > 0 {
 			maxAge := time.Duration(e.config.AutoSellAfterMinutes) * time.Minute
 			if time.Since(pos.OpenedAt) > maxAge {
+				pos.Status = StatusClosing
 				go e.executeSell(ctx, pos, "AUTO_SELL_TIMEOUT")
 				return
 			}
@@ -415,17 +439,31 @@ func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision
 			Float64("sell_pct", decision.SellPct).
 			Msg("sniper: DRY RUN partial sell")
 	} else {
+		// Validate sell amount.
+		e.mu.RLock()
+		currentAmount := pos.AmountToken
+		e.mu.RUnlock()
+
+		sellAmount := decision.SellAmount
+		if sellAmount.GreaterThan(currentAmount) {
+			sellAmount = currentAmount
+		}
+		if !sellAmount.IsPositive() {
+			return
+		}
+
 		params := solana.SwapParams{
-			InputMint:   pos.TokenMint,
-			OutputMint:  solana.SOLMint,
-			AmountIn:    decision.SellAmount,
-			SlippageBps: e.config.SlippageBps,
-			PriorityFee: 100_000,
+			InputMint:     pos.TokenMint,
+			OutputMint:    solana.SOLMint,
+			AmountIn:      sellAmount,
+			SlippageBps:   e.config.SlippageBps,
+			PriorityFee:   e.config.PriorityFee,
+			UseJitoBundle: e.config.UseJito,
 		}
 
 		_, err := e.jupiter.SwapDirect(ctx, params)
 		if err != nil {
-			log.Error().Err(err).Str("pos_id", pos.ID).Msg("sniper: partial sell FAILED")
+			log.Error().Err(err).Str("pos_id", pos.ID).Str("reason", decision.Reason).Msg("sniper: partial sell FAILED")
 			return
 		}
 	}
@@ -433,6 +471,9 @@ func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision
 	// Update position token amount.
 	e.mu.Lock()
 	pos.AmountToken = pos.AmountToken.Sub(decision.SellAmount)
+	if pos.AmountToken.IsNegative() {
+		pos.AmountToken = decimal.Zero
+	}
 	e.mu.Unlock()
 
 	e.totalSells.Add(1)
@@ -446,7 +487,7 @@ func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision
 // executeSell closes a position.
 func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) {
 	e.mu.Lock()
-	if pos.Status != StatusOpen {
+	if pos.Status == StatusClosed || pos.Status == StatusFailed {
 		e.mu.Unlock()
 		return
 	}
@@ -470,18 +511,29 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 			Msg("sniper: DRY RUN sell (no real transaction)")
 	} else {
 		params := solana.SwapParams{
-			InputMint:   pos.TokenMint,
-			OutputMint:  solana.SOLMint,
-			AmountIn:    pos.AmountToken,
-			SlippageBps: e.config.SlippageBps,
-			PriorityFee: 100_000,
+			InputMint:     pos.TokenMint,
+			OutputMint:    solana.SOLMint,
+			AmountIn:      pos.AmountToken,
+			SlippageBps:   e.config.SlippageBps,
+			PriorityFee:   e.config.PriorityFee,
+			UseJitoBundle: e.config.UseJito,
 		}
 
 		result, err := e.jupiter.SwapDirect(ctx, params)
 		if err != nil {
-			log.Error().Err(err).Str("pos_id", pos.ID).Msg("sniper: sell FAILED")
 			e.mu.Lock()
-			pos.Status = StatusOpen // Revert to open, try again next cycle
+			pos.SellRetries++
+			if pos.SellRetries >= e.config.MaxSellRetries {
+				log.Error().Err(err).Str("pos_id", pos.ID).Int("retries", pos.SellRetries).
+					Msg("sniper: sell PERMANENTLY FAILED after max retries")
+				pos.Status = StatusFailed
+				pos.CloseReason = fmt.Sprintf("SELL_FAILED_%s", reason)
+				pos.ClosedAt = &now
+			} else {
+				log.Warn().Err(err).Str("pos_id", pos.ID).Int("retry", pos.SellRetries).
+					Msg("sniper: sell failed, will retry next cycle")
+				pos.Status = StatusOpen // allow retry
+			}
 			e.mu.Unlock()
 			return
 		}
@@ -500,6 +552,12 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 		e.lossCount.Add(1)
 	} else {
 		e.winCount.Add(1)
+	}
+
+	// Cancel CSM for this position.
+	if cancel, ok := e.csmCancel[pos.ID]; ok {
+		cancel()
+		delete(e.csmCancel, pos.ID)
 	}
 
 	cb := e.onPositionClose
@@ -521,6 +579,9 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 
 // ForceClose forces all open positions to close.
 func (e *Engine) ForceClose(ctx context.Context) {
+	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	e.mu.RLock()
 	var openPositions []*Position
 	for _, p := range e.positions {
@@ -531,12 +592,12 @@ func (e *Engine) ForceClose(ctx context.Context) {
 	e.mu.RUnlock()
 
 	for _, pos := range openPositions {
-		e.executeSell(ctx, pos, "FORCE_CLOSE")
+		e.executeSell(shutdownCtx, pos, "FORCE_CLOSE")
 	}
 }
 
-// checkDailyLimits checks if daily spending/loss limits are exceeded.
-func (e *Engine) checkDailyLimits() bool {
+// reserveDailyBudget atomically checks and reserves daily budget.
+func (e *Engine) reserveDailyBudget() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -547,14 +608,16 @@ func (e *Engine) checkDailyLimits() bool {
 		e.dailyResetTime = startOfDay()
 	}
 
-	// Check daily spend.
+	buyAmount := decimal.NewFromFloat(e.config.MaxBuySOL)
 	maxSpend := decimal.NewFromFloat(e.config.MaxDailySpendSOL)
-	if e.dailySpentSOL.GreaterThanOrEqual(maxSpend) {
+	maxLoss := decimal.NewFromFloat(e.config.MaxDailyLossSOL)
+
+	// Check if we would exceed daily spend.
+	if e.dailySpentSOL.Add(buyAmount).GreaterThan(maxSpend) {
 		return false
 	}
 
 	// Check daily loss.
-	maxLoss := decimal.NewFromFloat(e.config.MaxDailyLossSOL)
 	if e.dailyLossSOL.GreaterThanOrEqual(maxLoss) {
 		return false
 	}

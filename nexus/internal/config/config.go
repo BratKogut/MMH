@@ -98,6 +98,7 @@ type SolanaConfig struct {
 	RPCEndpoint  string  `yaml:"rpc_endpoint"`
 	WSEndpoint   string  `yaml:"ws_endpoint"`
 	PrivateKey   string  `yaml:"private_key"`   // base58 encoded
+	WalletPubkey string  `yaml:"wallet_pubkey"` // base58 public key (if empty, derived from private_key context)
 	RateLimitRPS float64 `yaml:"rate_limit_rps"`
 }
 
@@ -122,6 +123,59 @@ type HunterConfig struct {
 	UseJito              bool     `yaml:"use_jito"`
 	JitoTipSOL           float64  `yaml:"jito_tip_sol"`
 	PriorityFee          uint64   `yaml:"priority_fee"`
+}
+
+// Validate checks the configuration for invalid or dangerous values.
+func (cfg *Config) Validate() error {
+	// Hunter validation.
+	h := cfg.Hunter
+	if h.Enabled {
+		if h.MaxBuySOL <= 0 {
+			return fmt.Errorf("config: hunter.max_buy_sol must be > 0 (got %f)", h.MaxBuySOL)
+		}
+		if h.MaxBuySOL > 10 {
+			return fmt.Errorf("config: hunter.max_buy_sol=%f is dangerously high (max recommended: 10 SOL)", h.MaxBuySOL)
+		}
+		if h.TakeProfitMultiplier <= 1.0 {
+			return fmt.Errorf("config: hunter.take_profit_multiplier must be > 1.0 (got %f)", h.TakeProfitMultiplier)
+		}
+		if h.StopLossPct <= 0 || h.StopLossPct > 100 {
+			return fmt.Errorf("config: hunter.stop_loss_pct must be 0-100 (got %f)", h.StopLossPct)
+		}
+		if h.SlippageBps <= 0 || h.SlippageBps > 5000 {
+			return fmt.Errorf("config: hunter.slippage_bps must be 1-5000 (got %d)", h.SlippageBps)
+		}
+		if h.MaxPositions <= 0 {
+			return fmt.Errorf("config: hunter.max_positions must be > 0 (got %d)", h.MaxPositions)
+		}
+		if h.MaxDailySpendSOL <= 0 {
+			return fmt.Errorf("config: hunter.max_daily_spend_sol must be > 0 (got %f)", h.MaxDailySpendSOL)
+		}
+		if h.MaxDailyLossSOL <= 0 {
+			return fmt.Errorf("config: hunter.max_daily_loss_sol must be > 0 (got %f)", h.MaxDailyLossSOL)
+		}
+	}
+
+	// Solana validation.
+	s := cfg.Solana
+	if s.RPCEndpoint == "" {
+		return fmt.Errorf("config: solana.rpc_endpoint must be set")
+	}
+	if s.RateLimitRPS <= 0 || s.RateLimitRPS > 1000 {
+		return fmt.Errorf("config: solana.rate_limit_rps must be 1-1000 (got %f)", s.RateLimitRPS)
+	}
+
+	// Warn about dry_run.
+	if !cfg.Hunter.DryRun && cfg.Hunter.Enabled {
+		if s.PrivateKey == "" {
+			return fmt.Errorf("config: solana.private_key required when hunter.dry_run=false")
+		}
+		if s.WalletPubkey == "" {
+			return fmt.Errorf("config: solana.wallet_pubkey required when hunter.dry_run=false")
+		}
+	}
+
+	return nil
 }
 
 // Load reads and parses a YAML configuration file.

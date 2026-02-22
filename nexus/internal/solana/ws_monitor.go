@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,7 +38,7 @@ func DefaultWSMonitorConfig() WSMonitorConfig {
 		},
 		ReconnectDelayMs: 1000,
 		PingIntervalS:    30,
-		MaxReconnects:    100,
+		MaxReconnects:    0, // 0 = unlimited reconnects
 	}
 }
 
@@ -51,6 +52,10 @@ type WSMonitor struct {
 
 	// Output channel for discovered pools.
 	poolChan chan PoolEvent
+	closed   atomic.Bool // tracks if poolChan is closed
+
+	// Subscription ID counter.
+	nextSubID atomic.Int64
 
 	// Stats.
 	messagesRecv  atomic.Int64
@@ -86,7 +91,14 @@ func (m *WSMonitor) Start(ctx context.Context) (<-chan PoolEvent, error) {
 }
 
 func (m *WSMonitor) runLoop(ctx context.Context) {
-	defer close(m.poolChan)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("ws: runLoop panic recovered")
+		}
+		if m.closed.CompareAndSwap(false, true) {
+			close(m.poolChan)
+		}
+	}()
 
 	reconnectDelay := time.Duration(m.config.ReconnectDelayMs) * time.Millisecond
 	reconnectCount := 0
@@ -99,9 +111,17 @@ func (m *WSMonitor) runLoop(ctx context.Context) {
 		default:
 		}
 
-		if reconnectCount >= m.config.MaxReconnects {
-			log.Error().Int("max", m.config.MaxReconnects).Msg("ws: max reconnects reached")
-			return
+		// Unlimited reconnects when MaxReconnects == 0.
+		if m.config.MaxReconnects > 0 && reconnectCount >= m.config.MaxReconnects {
+			log.Error().Int("max", m.config.MaxReconnects).Msg("ws: max reconnects reached, restarting counter after cooldown")
+			select {
+			case <-time.After(60 * time.Second):
+				reconnectCount = 0
+				continue
+			case <-ctx.Done():
+				m.disconnect()
+				return
+			}
 		}
 
 		if err := m.connect(ctx); err != nil {
@@ -109,9 +129,16 @@ func (m *WSMonitor) runLoop(ctx context.Context) {
 			reconnectCount++
 			m.reconnects.Add(1)
 
+			maxDelay := 30 * time.Second
+			if reconnectDelay > maxDelay {
+				reconnectDelay = maxDelay
+			}
 			select {
 			case <-time.After(reconnectDelay):
-				reconnectDelay = min(reconnectDelay*2, 30*time.Second) // exp backoff
+				reconnectDelay = reconnectDelay * 2
+				if reconnectDelay > maxDelay {
+					reconnectDelay = maxDelay
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -124,7 +151,11 @@ func (m *WSMonitor) runLoop(ctx context.Context) {
 		// Subscribe to all program IDs.
 		for _, programID := range m.config.ProgramIDs {
 			if err := m.subscribe(programID); err != nil {
-				log.Warn().Err(err).Str("program", programID[:8]).Msg("ws: subscribe failed")
+				pid := programID
+				if len(pid) > 8 {
+					pid = pid[:8]
+				}
+				log.Warn().Err(err).Str("program", pid).Msg("ws: subscribe failed")
 			}
 		}
 
@@ -173,9 +204,11 @@ func (m *WSMonitor) subscribe(programID string) error {
 		return fmt.Errorf("ws: not connected")
 	}
 
+	subID := m.nextSubID.Add(1)
+
 	req := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      1,
+		"id":      subID,
 		"method":  "logsSubscribe",
 		"params": []any{
 			map[string]any{
@@ -195,8 +228,12 @@ func (m *WSMonitor) subscribe(programID string) error {
 		return fmt.Errorf("ws: write subscribe: %w", err)
 	}
 
+	pid := programID
+	if len(pid) > 8 {
+		pid = pid[:8]
+	}
 	log.Info().
-		Str("program", programID[:8]).
+		Str("program", pid).
 		Str("dex", programIDToDEX(programID)).
 		Msg("ws: subscribed to program logs")
 
@@ -255,6 +292,12 @@ func (m *WSMonitor) readLoop(ctx context.Context) {
 }
 
 func (m *WSMonitor) handleMessage(data []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("ws: handleMessage panic recovered")
+		}
+	}()
+
 	// Parse subscription notification.
 	var notification struct {
 		Method string `json:"method"`
@@ -309,10 +352,20 @@ func (m *WSMonitor) handleMessage(data []byte) {
 
 	m.poolsDetected.Add(1)
 
+	// Safe send: check if channel is still open.
+	if m.closed.Load() {
+		return
+	}
+
+	sigPrefix := sig
+	if len(sigPrefix) > 12 {
+		sigPrefix = sigPrefix[:12]
+	}
+
 	select {
 	case m.poolChan <- event:
 		log.Info().
-			Str("sig", sig[:12]).
+			Str("sig", sigPrefix).
 			Str("dex", dex).
 			Uint64("slot", slot).
 			Msg("ws: NEW POOL DETECTED")
@@ -328,22 +381,22 @@ func isPoolCreationEvent(logs []string) bool {
 
 	for _, l := range logs {
 		// Raydium AMM pool init.
-		if contains(l, "InitializeInstruction2") || contains(l, "initialize2") {
+		if strings.Contains(l, "InitializeInstruction2") || strings.Contains(l, "initialize2") {
 			return true
 		}
 		// Orca Whirlpool init.
-		if contains(l, "InitializePool") {
+		if strings.Contains(l, "InitializePool") {
 			return true
 		}
 		// Meteora DLMM.
-		if contains(l, "InitializeLbPair") {
+		if strings.Contains(l, "InitializeLbPair") {
 			return true
 		}
 		// Pump.fun markers (may be on separate log lines).
-		if contains(l, "Create") {
+		if strings.Contains(l, "Create") {
 			hasCreate = true
 		}
-		if contains(l, "InitializeMint2") {
+		if strings.Contains(l, "InitializeMint2") {
 			hasInitMint = true
 		}
 	}
@@ -355,33 +408,20 @@ func isPoolCreationEvent(logs []string) bool {
 // detectDEXFromLogs determines which DEX created the pool.
 func detectDEXFromLogs(logs []string) string {
 	for _, l := range logs {
-		if contains(l, "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") {
+		if strings.Contains(l, "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") {
 			return "raydium"
 		}
-		if contains(l, "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P") {
+		if strings.Contains(l, "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P") {
 			return "pumpfun"
 		}
-		if contains(l, "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc") {
+		if strings.Contains(l, "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc") {
 			return "orca"
 		}
-		if contains(l, "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo") {
+		if strings.Contains(l, "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo") {
 			return "meteora"
 		}
 	}
 	return "unknown"
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // WSStats returns monitor statistics.

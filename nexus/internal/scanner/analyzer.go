@@ -129,12 +129,16 @@ func (a *Analyzer) Analyze(ctx context.Context, discovery PoolDiscovery) TokenAn
 		}
 	}
 
-	// Run all checks.
+	// Run all checks (nil-safe: checkMintAuthority/checkFreezeAuthority handle nil Token).
 	a.checkMintAuthority(&analysis)
 	a.checkFreezeAuthority(&analysis)
 	a.checkLiquidity(&analysis)
 	a.checkLPSafety(&analysis)
-	a.checkHolders(ctx, &analysis)
+
+	// Use timeout context for RPC calls in analysis.
+	analysisCtx, analysisCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer analysisCancel()
+	a.checkHolders(analysisCtx, &analysis)
 	a.checkPoolAge(&analysis)
 
 	// Clamp score.

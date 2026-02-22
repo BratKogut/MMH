@@ -25,8 +25,16 @@ type LiveRPCClient struct {
 	httpClient *http.Client
 
 	// Rate limiter (token bucket).
-	limiter   chan struct{}
-	limiterWg sync.WaitGroup
+	limiter    chan struct{}
+	limiterCtx context.Context
+	limiterCancel context.CancelFunc
+
+	// Unique request ID generator.
+	nextID atomic.Int64
+
+	// Circuit breaker.
+	consecutiveErrors atomic.Int64
+	circuitOpen       atomic.Bool
 
 	// WebSocket state for subscriptions.
 	wsURL string
@@ -34,9 +42,14 @@ type LiveRPCClient struct {
 	// Stats.
 	requestCount  atomic.Int64
 	errorCount    atomic.Int64
-	avgLatencyUs  atomic.Int64
+	latencySum    atomic.Int64 // cumulative microseconds
 	lastRequestAt atomic.Int64
 }
+
+const (
+	circuitBreakerThreshold = 10 // open after 10 consecutive errors
+	circuitBreakerCooldown  = 30 * time.Second
+)
 
 // NewLiveRPCClient creates a live Solana RPC client.
 func NewLiveRPCClient(config RPCConfig) *LiveRPCClient {
@@ -60,26 +73,33 @@ func NewLiveRPCClient(config RPCConfig) *LiveRPCClient {
 		limiter <- struct{}{}
 	}
 
+	limiterCtx, limiterCancel := context.WithCancel(context.Background())
+
 	client := &LiveRPCClient{
 		config: config,
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
-		limiter: limiter,
-		wsURL:   config.WSEndpoint,
+		limiter:       limiter,
+		limiterCtx:    limiterCtx,
+		limiterCancel: limiterCancel,
+		wsURL:         config.WSEndpoint,
 	}
 
-	// Refill tokens.
-	client.limiterWg.Add(1)
+	// Refill tokens at configured RPS.
 	go func() {
-		defer client.limiterWg.Done()
 		interval := time.Duration(float64(time.Second) / config.RateLimitRPS)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
 			select {
-			case client.limiter <- struct{}{}:
-			default: // bucket full
+			case <-limiterCtx.Done():
+				return
+			case <-ticker.C:
+				select {
+				case client.limiter <- struct{}{}:
+				default: // bucket full
+				}
 			}
 		}
 	}()
@@ -87,10 +107,15 @@ func NewLiveRPCClient(config RPCConfig) *LiveRPCClient {
 	return client
 }
 
+// Close shuts down the RPC client.
+func (c *LiveRPCClient) Close() {
+	c.limiterCancel()
+}
+
 // rpcRequest is a JSON-RPC 2.0 request.
 type rpcRequest struct {
 	JSONRPC string `json:"jsonrpc"`
-	ID      int    `json:"id"`
+	ID      int64  `json:"id"`
 	Method  string `json:"method"`
 	Params  []any  `json:"params,omitempty"`
 }
@@ -98,7 +123,7 @@ type rpcRequest struct {
 // rpcResponse is a JSON-RPC 2.0 response.
 type rpcResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      int             `json:"id"`
+	ID      int64           `json:"id"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *rpcError       `json:"error,omitempty"`
 }
@@ -110,6 +135,11 @@ type rpcError struct {
 
 // call makes a rate-limited, retried JSON-RPC call.
 func (c *LiveRPCClient) call(ctx context.Context, method string, params []any) (json.RawMessage, error) {
+	// Circuit breaker check.
+	if c.circuitOpen.Load() {
+		return nil, fmt.Errorf("rpc: circuit breaker open for %s (too many consecutive errors)", method)
+	}
+
 	// Acquire rate limit token.
 	select {
 	case <-c.limiter:
@@ -117,9 +147,11 @@ func (c *LiveRPCClient) call(ctx context.Context, method string, params []any) (
 		return nil, ctx.Err()
 	}
 
+	reqID := c.nextID.Add(1)
+
 	req := rpcRequest{
 		JSONRPC: "2.0",
-		ID:      1,
+		ID:      reqID,
 		Method:  method,
 		Params:  params,
 	}
@@ -133,6 +165,9 @@ func (c *LiveRPCClient) call(ctx context.Context, method string, params []any) (
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(1<<uint(attempt-1)) * 500 * time.Millisecond
+			if attempt > 1 {
+				backoff = time.Duration(1<<uint(attempt-1)) * time.Second // exponential: 1s, 2s, 4s
+			}
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -150,51 +185,86 @@ func (c *LiveRPCClient) call(ctx context.Context, method string, params []any) (
 
 		resp, err := c.httpClient.Do(httpReq)
 		if err != nil {
-			lastErr = fmt.Errorf("rpc: http error: %w", err)
+			lastErr = fmt.Errorf("rpc: %s http error: %w", method, err)
 			c.errorCount.Add(1)
+			c.recordError()
 			continue
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			lastErr = fmt.Errorf("rpc: read response: %w", err)
+			lastErr = fmt.Errorf("rpc: %s read response: %w", method, err)
 			c.errorCount.Add(1)
+			c.recordError()
 			continue
 		}
 
 		latency := time.Since(start)
 		c.requestCount.Add(1)
-		c.avgLatencyUs.Store(latency.Microseconds())
+		c.latencySum.Add(latency.Microseconds())
 		c.lastRequestAt.Store(time.Now().UnixMilli())
 
 		if resp.StatusCode == 429 {
-			lastErr = fmt.Errorf("rpc: rate limited (429)")
+			lastErr = fmt.Errorf("rpc: %s rate limited (429)", method)
 			c.errorCount.Add(1)
+			// Longer backoff on 429 - don't count as circuit-breaker error.
+			select {
+			case <-time.After(time.Duration(2<<uint(attempt)) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			lastErr = fmt.Errorf("rpc: HTTP %d: %s", resp.StatusCode, string(respBody))
+			lastErr = fmt.Errorf("rpc: %s HTTP %d: %s", method, resp.StatusCode, string(respBody))
 			c.errorCount.Add(1)
+			c.recordError()
 			continue
 		}
 
 		var rpcResp rpcResponse
 		if err := json.Unmarshal(respBody, &rpcResp); err != nil {
-			lastErr = fmt.Errorf("rpc: unmarshal response: %w", err)
+			lastErr = fmt.Errorf("rpc: %s unmarshal response: %w", method, err)
 			c.errorCount.Add(1)
+			c.recordError()
 			continue
 		}
 
 		if rpcResp.Error != nil {
+			c.resetErrors()
 			return nil, fmt.Errorf("rpc: %s error %d: %s", method, rpcResp.Error.Code, rpcResp.Error.Message)
 		}
 
+		// Success - reset circuit breaker.
+		c.resetErrors()
 		return rpcResp.Result, nil
 	}
 
 	return nil, fmt.Errorf("rpc: %s failed after %d attempts: %w", method, c.config.MaxRetries+1, lastErr)
+}
+
+// recordError increments consecutive errors and opens circuit breaker if needed.
+func (c *LiveRPCClient) recordError() {
+	count := c.consecutiveErrors.Add(1)
+	if count >= circuitBreakerThreshold {
+		if c.circuitOpen.CompareAndSwap(false, true) {
+			log.Error().Int64("errors", count).Msg("rpc: CIRCUIT BREAKER OPEN - too many consecutive errors")
+			// Auto-reset after cooldown.
+			go func() {
+				time.Sleep(circuitBreakerCooldown)
+				c.circuitOpen.Store(false)
+				c.consecutiveErrors.Store(0)
+				log.Info().Msg("rpc: circuit breaker reset")
+			}()
+		}
+	}
+}
+
+// resetErrors resets the consecutive error counter.
+func (c *LiveRPCClient) resetErrors() {
+	c.consecutiveErrors.Store(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +325,9 @@ func (c *LiveRPCClient) GetTopHolders(ctx context.Context, mint Pubkey, limit in
 
 	var resp struct {
 		Value []struct {
-			Address  string `json:"address"`
-			Amount   string `json:"amount"`
-			Decimals uint8  `json:"decimals"`
+			Address  string  `json:"address"`
+			Amount   string  `json:"amount"`
+			Decimals uint8   `json:"decimals"`
 			UIAmount float64 `json:"uiAmount"`
 		} `json:"value"`
 	}
@@ -267,9 +337,9 @@ func (c *LiveRPCClient) GetTopHolders(ctx context.Context, mint Pubkey, limit in
 	}
 
 	// Get total supply for percentage calculation.
-	tokenInfo, _ := c.GetTokenInfo(ctx, mint)
-	totalSupply := decimal.NewFromFloat(1)
-	if tokenInfo != nil && tokenInfo.Supply.IsPositive() {
+	tokenInfo, tokenErr := c.GetTokenInfo(ctx, mint)
+	totalSupply := decimal.Zero
+	if tokenErr == nil && tokenInfo != nil && tokenInfo.Supply.IsPositive() {
 		totalSupply = tokenInfo.Supply
 	}
 
@@ -361,15 +431,12 @@ func (c *LiveRPCClient) GetWalletBalance(ctx context.Context, wallet Pubkey) (*W
 }
 
 // GetRecentPools fetches recently created pools by scanning program logs.
-// In practice, this would use getProgramAccounts or a specialized indexer.
 func (c *LiveRPCClient) GetRecentPools(ctx context.Context, dex string, sinceMinutes int) ([]PoolInfo, error) {
-	// For Raydium AMM, query recent program accounts.
 	programID := dexProgramID(dex)
 	if programID == "" {
 		return nil, fmt.Errorf("rpc: unknown DEX: %s", dex)
 	}
 
-	// Use getSignaturesForAddress to find recent pool creation txs.
 	result, err := c.call(ctx, "getSignaturesForAddress", []any{
 		programID,
 		map[string]any{"limit": 20},
@@ -392,8 +459,6 @@ func (c *LiveRPCClient) GetRecentPools(ctx context.Context, dex string, sinceMin
 		if sig.BlockTime < cutoff {
 			continue
 		}
-		// Each signature potentially represents a pool creation.
-		// In production, we'd parse the tx to extract pool details.
 		pools = append(pools, PoolInfo{
 			DEX:       dex,
 			CreatedAt: time.Unix(sig.BlockTime, 0),
@@ -428,7 +493,6 @@ func (c *LiveRPCClient) GetPoolInfo(ctx context.Context, poolAddress Pubkey) (*P
 		return nil, fmt.Errorf("rpc: pool %s not found", poolAddress)
 	}
 
-	// Determine DEX from program owner.
 	dex := programIDToDEX(accountResp.Value.Owner)
 
 	return &PoolInfo{
@@ -491,6 +555,7 @@ func (c *LiveRPCClient) GetTransactionStatus(ctx context.Context, sig Signature)
 }
 
 // SubscribeNewPools opens a WebSocket subscription for new pool creation.
+// Uses HTTP polling as fallback (WS handled by WSMonitor).
 func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-chan PoolInfo, error) {
 	programID := dexProgramID(dex)
 	if programID == "" {
@@ -499,7 +564,6 @@ func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-ch
 
 	out := make(chan PoolInfo, 100)
 
-	// Fallback: poll via HTTP until WebSocket is implemented.
 	go func() {
 		defer close(out)
 		ticker := time.NewTicker(2 * time.Second)
@@ -514,7 +578,7 @@ func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-ch
 			case <-ticker.C:
 				pools, err := c.GetRecentPools(ctx, dex, 5)
 				if err != nil {
-					log.Debug().Err(err).Msg("rpc: poll pools error")
+					log.Debug().Err(err).Str("dex", dex).Msg("rpc: poll pools error")
 					continue
 				}
 				for _, pool := range pools {
@@ -537,24 +601,35 @@ func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-ch
 
 // Health checks the RPC endpoint health.
 func (c *LiveRPCClient) Health(ctx context.Context) error {
-	_, err := c.call(ctx, "getHealth", nil)
+	healthCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := c.call(healthCtx, "getHealth", nil)
 	return err
 }
 
 // RPCStats returns RPC client statistics.
 type RPCStats struct {
-	RequestCount  int64 `json:"request_count"`
-	ErrorCount    int64 `json:"error_count"`
-	AvgLatencyUs  int64 `json:"avg_latency_us"`
-	LastRequestAt int64 `json:"last_request_at"`
+	RequestCount    int64 `json:"request_count"`
+	ErrorCount      int64 `json:"error_count"`
+	AvgLatencyUs    int64 `json:"avg_latency_us"`
+	LastRequestAt   int64 `json:"last_request_at"`
+	CircuitOpen     bool  `json:"circuit_open"`
+	ConsecErrors    int64 `json:"consecutive_errors"`
 }
 
 func (c *LiveRPCClient) Stats() RPCStats {
+	reqCount := c.requestCount.Load()
+	avgLatency := int64(0)
+	if reqCount > 0 {
+		avgLatency = c.latencySum.Load() / reqCount
+	}
 	return RPCStats{
-		RequestCount:  c.requestCount.Load(),
+		RequestCount:  reqCount,
 		ErrorCount:    c.errorCount.Load(),
-		AvgLatencyUs:  c.avgLatencyUs.Load(),
+		AvgLatencyUs:  avgLatency,
 		LastRequestAt: c.lastRequestAt.Load(),
+		CircuitOpen:   c.circuitOpen.Load(),
+		ConsecErrors:  c.consecutiveErrors.Load(),
 	}
 }
 
@@ -562,32 +637,33 @@ func (c *LiveRPCClient) Stats() RPCStats {
 // DEX program ID mappings
 // ---------------------------------------------------------------------------
 
-func dexProgramID(dex string) string {
-	switch dex {
-	case "raydium":
-		return "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" // Raydium AMM V4
-	case "pumpfun":
-		return "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"  // Pump.fun
-	case "orca":
-		return "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"  // Orca Whirlpool
-	case "meteora":
-		return "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"  // Meteora DLMM
-	default:
-		return ""
+// Known DEX program IDs on Solana mainnet.
+var dexPrograms = map[string]string{
+	"raydium":  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium AMM V4
+	"pumpfun":  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  // Pump.fun
+	"orca":     "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  // Orca Whirlpool
+	"meteora":  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  // Meteora DLMM
+}
+
+var programToDEX map[string]string
+
+func init() {
+	programToDEX = make(map[string]string, len(dexPrograms))
+	for dex, pid := range dexPrograms {
+		programToDEX[pid] = dex
 	}
 }
 
-func programIDToDEX(programID string) string {
-	switch programID {
-	case "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8":
-		return "raydium"
-	case "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":
-		return "pumpfun"
-	case "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc":
-		return "orca"
-	case "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo":
-		return "meteora"
-	default:
-		return "unknown"
-	}
+func dexProgramID(dex string) string {
+	return dexPrograms[dex]
 }
+
+func programIDToDEX(programID string) string {
+	if dex, ok := programToDEX[programID]; ok {
+		return dex
+	}
+	return "unknown"
+}
+
+// mu protects wsMonitor.
+var wsMonitorMu sync.Mutex
