@@ -36,18 +36,33 @@ func TestSellSimulator_SuccessfulSell(t *testing.T) {
 	assert.Empty(t, result.RevertReason)
 }
 
-func TestSellSimulator_FailedSell(t *testing.T) {
+func TestSellSimulator_FailedSell_ZeroReserves(t *testing.T) {
 	rpc := solana.NewStubRPCClient()
-	rpc.SetSendError(true) // stub will return error
 	sim := NewSellSimulator(rpc)
 
 	pool := newTestPoolForSellSim()
+	pool.QuoteReserve = decimal.Zero // no liquidity
+	pool.TokenReserve = decimal.Zero
 	amount := decimal.NewFromFloat(1000)
 
 	result := sim.SimulateSell(context.Background(), solana.Pubkey("token-sellsim"), amount, pool)
 
 	assert.False(t, result.CanSell)
 	assert.NotEmpty(t, result.RevertReason)
+}
+
+func TestSellSimulator_FailedSell_DrainReserves(t *testing.T) {
+	rpc := solana.NewStubRPCClient()
+	sim := NewSellSimulator(rpc)
+
+	pool := newTestPoolForSellSim()
+	// Selling so many tokens that output > 90% of quote reserves.
+	amount := decimal.NewFromFloat(100000000) // 100x token reserve
+
+	result := sim.SimulateSell(context.Background(), solana.Pubkey("token-sellsim"), amount, pool)
+
+	assert.False(t, result.CanSell)
+	assert.Contains(t, result.RevertReason, "90%")
 }
 
 func TestSellSimulator_ExpectedOutput_AMM(t *testing.T) {
@@ -96,17 +111,18 @@ func TestSellSimulator_PreBuy(t *testing.T) {
 	assert.Greater(t, result.AmountOut.InexactFloat64(), 0.0)
 }
 
-func TestSellSimulator_PreBuy_ZeroPrice(t *testing.T) {
+func TestSellSimulator_PreBuy_ZeroReserves(t *testing.T) {
 	rpc := solana.NewStubRPCClient()
 	sim := NewSellSimulator(rpc)
 
 	pool := newTestPoolForSellSim()
-	pool.PriceUSD = decimal.Zero
+	pool.QuoteReserve = decimal.Zero
+	pool.TokenReserve = decimal.Zero
 
 	result := sim.SimulatePreBuy(context.Background(), decimal.NewFromFloat(0.5), pool)
 
 	assert.False(t, result.CanSell)
-	assert.Equal(t, "zero price", result.RevertReason)
+	assert.NotEmpty(t, result.RevertReason)
 }
 
 func TestSellSimulator_EmptyReserves(t *testing.T) {

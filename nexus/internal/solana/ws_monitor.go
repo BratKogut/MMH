@@ -95,9 +95,12 @@ func (m *WSMonitor) runLoop(ctx context.Context) {
 		if r := recover(); r != nil {
 			log.Error().Interface("panic", r).Msg("ws: runLoop panic recovered")
 		}
+		// Acquire write lock to synchronize with handleMessage's channel send.
+		m.mu.Lock()
 		if m.closed.CompareAndSwap(false, true) {
 			close(m.poolChan)
 		}
+		m.mu.Unlock()
 	}()
 
 	reconnectDelay := time.Duration(m.config.ReconnectDelayMs) * time.Millisecond
@@ -352,26 +355,28 @@ func (m *WSMonitor) handleMessage(data []byte) {
 
 	m.poolsDetected.Add(1)
 
-	// Safe send: check if channel is still open.
-	if m.closed.Load() {
-		return
-	}
-
 	sigPrefix := sig
 	if len(sigPrefix) > 12 {
 		sigPrefix = sigPrefix[:12]
 	}
 
-	select {
-	case m.poolChan <- event:
-		log.Info().
-			Str("sig", sigPrefix).
-			Str("dex", dex).
-			Uint64("slot", slot).
-			Msg("ws: NEW POOL DETECTED")
-	default:
-		log.Warn().Msg("ws: pool channel full, dropping event")
+	// Synchronize channel send with close using mutex to prevent
+	// send-on-closed-channel panic (atomic check alone is racy).
+	m.mu.RLock()
+	closed := m.closed.Load()
+	if !closed {
+		select {
+		case m.poolChan <- event:
+			log.Info().
+				Str("sig", sigPrefix).
+				Str("dex", dex).
+				Uint64("slot", slot).
+				Msg("ws: NEW POOL DETECTED")
+		default:
+			log.Warn().Msg("ws: pool channel full, dropping event")
+		}
 	}
+	m.mu.RUnlock()
 }
 
 // isPoolCreationEvent checks logs for pool initialization markers.

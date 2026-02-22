@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/nexus-trading/nexus/internal/solana"
@@ -36,37 +35,37 @@ func NewSellSimulator(rpc solana.RPCClient) *SellSimulator {
 	return &SellSimulator{rpc: rpc}
 }
 
-// SimulateSell simulates selling a token amount and checks for honeypot behavior.
+// SimulateSell estimates whether selling a token is possible using pool math.
+// NOTE: Uses AMM math estimation since RPCClient lacks simulateTransaction.
+// When real simulation is available, replace with actual tx simulation.
 func (s *SellSimulator) SimulateSell(ctx context.Context, tokenMint solana.Pubkey, amount decimal.Decimal, pool solana.PoolInfo) SellSimResult {
-	expectedOut := s.calculateExpectedOutput(amount, pool)
-
-	// Attempt simulation via RPC simulateTransaction.
-	simTx := fmt.Sprintf("sell-sim:%s:%s", tokenMint, amount.String())
-	_, err := s.rpc.SendTransaction(ctx, simTx)
-
-	if err != nil {
-		log.Warn().
-			Err(err).
-			Str("mint", string(tokenMint)).
-			Msg("sellsim: SELL REVERTED - potential honeypot")
-
+	// Check if pool has enough reserves for any sell.
+	if pool.QuoteReserve.IsZero() || pool.TokenReserve.IsZero() {
 		return SellSimResult{
 			CanSell:      false,
-			RevertReason: err.Error(),
+			RevertReason: "pool reserves are zero - cannot sell",
 			SimulatedAt:  time.Now().UnixNano(),
 		}
 	}
 
-	// Estimate tax from pool math (real impl would compare simulated output).
-	taxPct := 0.0
-	if expectedOut.IsPositive() {
-		actualOut := expectedOut.Mul(decimal.NewFromFloat(0.95))
-		diff := expectedOut.Sub(actualOut)
-		taxPctDec := diff.Div(expectedOut).Mul(decimal.NewFromInt(100))
-		taxPct, _ = taxPctDec.Float64()
+	expectedOut := s.calculateExpectedOutput(amount, pool)
+
+	// A sell that would drain >90% of quote reserves is infeasible.
+	if expectedOut.GreaterThan(pool.QuoteReserve.Mul(decimal.NewFromFloat(0.9))) {
+		return SellSimResult{
+			CanSell:      false,
+			RevertReason: "sell would drain >90% of pool quote reserves",
+			SimulatedAt:  time.Now().UnixNano(),
+		}
 	}
 
+	// Estimate tax/honeypot risk from price impact.
 	priceImpact := s.calculatePriceImpact(amount, pool)
+	taxPct := 0.0
+	if priceImpact > 50.0 {
+		// Extremely high price impact suggests hidden sell tax or honeypot.
+		taxPct = priceImpact - 50.0
+	}
 
 	return SellSimResult{
 		CanSell:           true,
@@ -78,20 +77,30 @@ func (s *SellSimulator) SimulateSell(ctx context.Context, tokenMint solana.Pubke
 	}
 }
 
-// SimulatePreBuy simulates selling the exact amount we'd receive from buying.
+// SimulatePreBuy estimates sell feasibility for the token amount we'd receive from buying.
 // Plan v3.1 D4: verify exit BEFORE entry.
+// Uses AMM constant-product formula (buy SOL -> token, then simulate reverse).
 func (s *SellSimulator) SimulatePreBuy(ctx context.Context, buyAmountSOL decimal.Decimal, pool solana.PoolInfo) SellSimResult {
-	if pool.PriceUSD.IsZero() {
+	if pool.QuoteReserve.IsZero() || pool.TokenReserve.IsZero() {
 		return SellSimResult{
 			CanSell:      false,
-			RevertReason: "zero price",
+			RevertReason: "pool reserves are zero",
 			SimulatedAt:  time.Now().UnixNano(),
 		}
 	}
 
-	solPriceUSD := decimal.NewFromFloat(150.0)
-	buyValueUSD := buyAmountSOL.Mul(solPriceUSD)
-	estimatedTokens := buyValueUSD.Div(pool.PriceUSD)
+	// Estimate tokens received from buying (constant product: x * y = k).
+	// buyAmountSOL goes into QuoteReserve, we get tokens out of TokenReserve.
+	numerator := buyAmountSOL.Mul(pool.TokenReserve)
+	denominator := pool.QuoteReserve.Add(buyAmountSOL)
+	if denominator.IsZero() {
+		return SellSimResult{
+			CanSell:      false,
+			RevertReason: "zero denominator in buy estimation",
+			SimulatedAt:  time.Now().UnixNano(),
+		}
+	}
+	estimatedTokens := numerator.Div(denominator)
 
 	log.Debug().
 		Str("mint", string(pool.TokenMint)).

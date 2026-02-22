@@ -158,7 +158,9 @@ func (e *TriggerEngine) OnVolatility(ctx context.Context, symbol string, vol flo
 	}
 
 	// Calculate rolling mean (exclude the current sample to avoid self-influence).
-	mean := rollingMean(state.volSamples, state.volIdx, len(state.volSamples))
+	// volIdx has already been incremented, so the current sample is at volIdx-1.
+	currentSampleIdx := (state.volIdx - 1 + len(state.volSamples)) % len(state.volSamples)
+	mean := rollingMean(state.volSamples, currentSampleIdx, len(state.volSamples))
 
 	// Check for spike.
 	if mean > 0 && vol > mean*e.config.VolSpikeThreshold {
@@ -390,15 +392,23 @@ func (e *TriggerEngine) checkSchedule(ctx context.Context, now time.Time) {
 	}
 }
 
-// rollingMean computes the mean of the circular buffer, optionally excluding
-// the most recent sample (at idx-1).
-func rollingMean(samples []float64, _ int, n int) float64 {
-	if n == 0 {
+// rollingMean computes the mean of the circular buffer, excluding
+// the most recent sample (at idx) to avoid self-influence in spike detection.
+func rollingMean(samples []float64, excludeIdx int, n int) float64 {
+	if n <= 1 {
 		return 0
 	}
 	var sum float64
+	count := 0
 	for i := 0; i < n; i++ {
+		if i == excludeIdx {
+			continue
+		}
 		sum += samples[i]
+		count++
 	}
-	return sum / float64(n)
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
 }
