@@ -303,13 +303,13 @@ class MMHApplication:
                 providers[chain] = [
                     BirdeyeProvider(
                         api_key=self._settings.birdeye_api_key,
-                        rate_limit=self._settings.rate_limit_birdeye,
+                        rate_limit_per_sec=self._settings.rate_limit_birdeye,
                     )
                 ]
             elif chain in ("base", "bsc"):
                 providers[chain] = [
                     GoPlusProvider(
-                        rate_limit=self._settings.rate_limit_goplus,
+                        rate_limit_per_sec=self._settings.rate_limit_goplus,
                     )
                 ]
 
@@ -348,18 +348,59 @@ class MMHApplication:
             config=risk_config,
         )
 
+        # ---- 11b. Initialize Wallet Manager ----------------------------------
+        from src.wallet.wallet_manager import WalletManager
+
+        wallet_manager = WalletManager(self._settings)
+        for chain in self._settings.enabled_chains:
+            if wallet_manager.is_configured(chain):
+                logger.info("Wallet configured for %s: %s", chain, wallet_manager.get_address(chain))
+            else:
+                logger.warning("No wallet configured for %s (dry-run only)", chain)
+
+        # ---- 11c. Initialize Chain Executors ---------------------------------
+        from src.executor.solana_executor import SolanaExecutor
+        from src.executor.evm_executor import EVMExecutor
+
+        chain_executors: dict = {}
+        solana_executor = None
+        evm_executors: dict = {}
+
+        for chain in self._settings.enabled_chains:
+            if chain == "solana" and self._settings.solana_rpc_url:
+                sol_exec = SolanaExecutor(
+                    rpc_url=self._settings.solana_rpc_url,
+                    wallet_manager=wallet_manager,
+                    settings=self._settings,
+                )
+                chain_executors["solana"] = sol_exec.execute
+                solana_executor = sol_exec
+                logger.info("SolanaExecutor initialized (Jupiter V6 + Jito)")
+            elif chain in ("base", "bsc", "arbitrum"):
+                rpc_url = getattr(self._settings, f"{chain}_rpc_url", "") or self._settings.base_rpc_url
+                evm_exec = EVMExecutor(
+                    chain=chain,
+                    rpc_url=rpc_url,
+                    wallet_manager=wallet_manager,
+                    settings=self._settings,
+                )
+                chain_executors[chain] = evm_exec.execute
+                evm_executors[chain] = evm_exec
+                logger.info("EVMExecutor initialized for %s (0x + Uniswap V3)", chain)
+
         # ---- 12. Initialize Executor ---------------------------------------
         from src.executor.executor import Executor
 
         executor_config = {
             "circuit_breaker_threshold": self._settings.circuit_breaker_threshold,
             "circuit_breaker_timeout_seconds": self._settings.circuit_breaker_timeout_seconds,
-            "max_execution_retries": 2,
+            "max_execution_retries": self._settings.max_execution_retries,
         }
         executor = Executor(
             bus=self._bus,
             redis_client=self._redis,
             config=executor_config,
+            chain_executors=chain_executors,
             dry_run=self._settings.dry_run,
         )
 
@@ -393,6 +434,18 @@ class MMHApplication:
             config=control_config,
         )
 
+        # ---- 14b. Initialize Exit Executor -----------------------------------
+        from src.executor.exit_executor import ExitExecutor
+
+        exit_executor = ExitExecutor(
+            solana_executor=solana_executor,
+            evm_executors=evm_executors,
+            bus=self._bus,
+            position_manager=position_manager,
+            dry_run=self._settings.dry_run,
+        )
+        logger.info("ExitExecutor initialized")
+
         # ---- 15. Initialize Decision Journal --------------------------------
         journal = None
         try:
@@ -406,6 +459,24 @@ class MMHApplication:
                 "decision journal will not start"
             )
 
+        # ---- 16. Initialize Telegram Bot ------------------------------------
+        telegram_bot = None
+        if self._settings.telegram_bot_token and self._settings.telegram_chat_id:
+            try:
+                from src.telegram.bot import TelegramBot
+
+                telegram_bot = TelegramBot(
+                    bot_token=self._settings.telegram_bot_token,
+                    chat_id=self._settings.telegram_chat_id,
+                    redis_client=self._redis,
+                    bus=self._bus,
+                )
+                logger.info("Telegram bot initialized")
+            except ImportError:
+                logger.warning("python-telegram-bot not available, skipping Telegram bot")
+            except Exception as exc:
+                logger.warning("Telegram bot init failed: %s", exc)
+
         # ---- Register all services for lifecycle management -----------------
         # Order matters: this list is iterated forwards for start() and
         # backwards for stop() (graceful reverse teardown).
@@ -416,11 +487,14 @@ class MMHApplication:
             ("scoring", scoring),
             ("risk_fabric", risk_fabric),
             ("executor", executor),
+            ("exit_executor", exit_executor),
             ("position_manager", position_manager),
             ("control_plane", control_plane),
         ]
         if journal is not None:
             self._services.append(("decision_journal", journal))
+        if telegram_bot is not None:
+            self._services.append(("telegram_bot", telegram_bot))
 
         logger.info("All services initialized")
 

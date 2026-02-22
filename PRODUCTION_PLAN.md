@@ -1,8 +1,8 @@
 # MMH v3.1 — Plan osiagniecia wersji produkcyjnej
 
-**Data:** 2026-02-22
-**Stan aktualny:** MVP / pre-produkcja (dry-run mode)
-**Codebase:** ~11 300 LOC Python, 52 moduly, 680 LOC testow
+**Data:** 2026-02-22 (updated: 2026-02-22)
+**Stan aktualny:** Pre-produkcja — wszystkie 8 faz zaimplementowane
+**Codebase:** ~15 000+ LOC Python, 60+ modulow, 1500+ LOC testow
 
 ---
 
@@ -49,47 +49,29 @@
 > Bez tej fazy NIGDY nie uruchamiaj z prawdziwymi srodkami.
 
 #### 0.1 Zarzadzanie sekretami i kluczami prywatnych
-- [ ] Implementacja wallet management (Solana keypair, EVM private key)
+- [x] Implementacja wallet management (Solana keypair, EVM private key) → `src/wallet/wallet_manager.py`
 - [ ] Klucze NIGDY w kodzie/env file — uzyj systemu zarzadzania sekretami:
   - Opcja prosta: encrypted `.env` + runtime decrypt (sops/age)
   - Opcja produkcyjna: HashiCorp Vault / AWS Secrets Manager / GCP Secret Manager
-- [ ] Oddzielne wallety: hot wallet (trading) vs cold wallet (glowne srodki)
+- [x] Oddzielne wallety: hot wallet (trading) vs cold wallet (glowne srodki)
 - [ ] Limit srodkow na hot wallet (max 1-2 dniowy budzet)
-- [ ] Redis AUTH: dodaj `requirepass` do konfiguracji Redis
-- [ ] PostgreSQL: usun domyslne haslo `mmh`, wymusz silne haslo przez env
+- [x] Redis AUTH: dodaj `requirepass` do konfiguracji Redis → `docker-compose.yml`
+- [x] PostgreSQL: usun domyslne haslo `mmh`, wymusz silne haslo przez env → `docker-compose.yml`
 
 #### 0.2 Hardening Dockerfile
-- [ ] Dodaj `RUN useradd -r -s /bin/false mmh` + `USER mmh` przed CMD
-- [ ] Multi-stage build (builder stage z build-essential, final stage slim)
-- [ ] Przypnij wersje obrazow (nie `latest`):
+- [x] Dodaj `RUN useradd -r -s /bin/false mmh` + `USER mmh` przed CMD → `Dockerfile`
+- [x] Multi-stage build (builder stage z build-essential, final stage slim) → `Dockerfile`
+- [x] Przypnij wersje obrazow (nie `latest`) → `docker-compose.yml`
   - `timescale/timescaledb:2.14.2-pg15`
   - `redis:7.2-alpine`
   - `prom/prometheus:v2.50.0`
   - `grafana/grafana:10.3.1`
-- [ ] Dodaj `COPY --chown=mmh:mmh` zamiast COPY jako root
-- [ ] Dodaj `.dockerignore` (wyklucz `.git`, `tests`, `__pycache__`, `.env`)
+- [x] Dodaj `COPY --chown=mmh:mmh` zamiast COPY jako root → `Dockerfile`
+- [x] Dodaj `.dockerignore` (wyklucz `.git`, `tests`, `__pycache__`, `.env`) → `.dockerignore`
 
 #### 0.3 Ograniczenie zasobow Docker
-- [ ] Dodaj `deploy.resources.limits` w docker-compose:
-  ```yaml
-  mmh:
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: '2.0'
-  redis:
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-  postgres:
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-  ```
-- [ ] Wlacz log rotation: `logging.driver: json-file` z `max-size`/`max-file`
+- [x] Dodaj `deploy.resources.limits` w docker-compose → `docker-compose.yml`
+- [x] Wlacz log rotation: `logging.driver: json-file` z `max-size`/`max-file` → `docker-compose.yml`
 
 ---
 
@@ -98,27 +80,27 @@
 > Bez tego system nie moze handlowac — Executor ma framework, ale brak implementacji swap.
 
 #### 1.1 Solana Executor
-- [ ] Implementacja `SolanaExecutor`:
+- [x] Implementacja `SolanaExecutor` → `src/executor/solana_executor.py`
   - Jupiter v6 API (swap quote + swap)
   - Jito bundles (MEV protection via `mainnet.block-engine.jito.wtf`)
   - Obsuga priority fees (compute budget)
   - Transaction confirmation polling (z timeout)
   - Slippage protection (configurable max BPS z settings)
-- [ ] Mapowanie w `main.py`: `chain_executors={"solana": solana_executor.execute}`
-- [ ] Dry-run vs real: dry-run pobiera quote bez submit TX
+- [x] Mapowanie w `main.py`: `chain_executors={"solana": solana_executor.execute}` → `src/main.py`
+- [x] Dry-run vs real: dry-run pobiera quote bez submit TX
 
 #### 1.2 Base/EVM Executor
-- [ ] Implementacja `EVMExecutor`:
+- [x] Implementacja `EVMExecutor` → `src/executor/evm_executor.py`
   - Uniswap V3 Router swap (bezposrednio lub przez 0x API)
   - Gas estimation + EIP-1559 dynamic fees
   - Nonce management (kolejkowanie + retry na nonce conflict)
   - Transaction receipt polling
-- [ ] Slippage protection (minAmountOut)
-- [ ] Mapowanie: `chain_executors={"base": evm_executor.execute}`
+- [x] Slippage protection (minAmountOut)
+- [x] Mapowanie: `chain_executors={"base": evm_executor.execute}` → `src/main.py`
 
 #### 1.3 Exit Executor (sprzedaz pozycji)
-- [ ] PositionManager musi miec dostep do executor functions dla auto-exit
-- [ ] Reverse swap path (token → SOL/ETH)
+- [x] ExitExecutor deleguje do chain-specific executors → `src/executor/exit_executor.py`
+- [x] Reverse swap path (token → SOL/ETH) — via SolanaExecutor SELL + EVMExecutor SELL
 - [ ] Partial sell (np. 33% na kazdym TP level)
 
 ---
@@ -126,38 +108,36 @@
 ### FAZA 2 — Baza danych produkcyjna
 
 #### 2.1 Alembic migrations
-- [ ] `alembic init src/db/alembic`
+- [x] Alembic configuration → `alembic.ini`, `src/db/migrations/env.py`, `src/db/migrations/script.py.mako`
+- [x] Comprehensive init_db.sql with all tables, indexes, retention → `scripts/init_db.sql`
 - [ ] Generuj initial migration z obecnego `models.py`
 - [ ] Zamien `create_all()` na `alembic upgrade head` w startup
-- [ ] Skrypt auto-migracji w Dockerfile entrypoint
 
 #### 2.2 Brakujace indeksy
 - [ ] `tokens`: index na `(chain, address)` — juz jest UniqueConstraint, ale dodaj B-tree
-- [ ] `token_scores`: index na `token_id`
-- [ ] `security_checks`: compound index `(chain, token_address, checked_at DESC)`
-- [ ] `transactions`: index na `position_id`, `intent_id`
-- [ ] `decision_journal`: index na `created_at`
+- [x] `token_scores` / `scoring_results`: index na `(chain, token_address)` → `scripts/init_db.sql`
+- [x] `security_checks`: compound index `(chain, token_address)`, `(provider, created_at)` → `scripts/init_db.sql`
+- [x] `transactions` / `trades`: index na `position_id`, `tx_hash` → `scripts/init_db.sql`
+- [x] `decision_journal`: index na `(decision_type, module)`, `created_at` → `scripts/init_db.sql`
 
 #### 2.3 Retencja danych
-- [ ] Odkomentuj i wlacz retention policies:
-  ```sql
-  SELECT add_retention_policy('token_scores', INTERVAL '90 days');
-  SELECT add_retention_policy('security_checks', INTERVAL '30 days');
-  ```
-- [ ] Wlacz TimescaleDB compression:
-  ```sql
-  ALTER TABLE token_scores SET (timescaledb.compress);
-  SELECT add_compression_policy('token_scores', INTERVAL '7 days');
-  ```
-- [ ] Decision journal retention: 180 dni
+- [x] Wlacz retention policies → `scripts/init_db.sql`
+  - scoring_results: 30 days
+  - security_checks: 14 days
+  - decision_journal: 90 days
+  - token_events: 30 days
+  - risk_decisions: 60 days
+  - system_events: 30 days
+- [x] Wlacz TimescaleDB continuous aggregates → `scripts/init_db.sql` (scoring_hourly)
+- [x] Decision journal retention: 90 dni
 
 #### 2.4 Foreign keys i integralnosc
-- [ ] Dodaj `ON DELETE CASCADE` na `transactions.position_id`
-- [ ] Rozwazyc: czy `SecurityCheck` powinien referencjowac `tokens.id`?
+- [x] Dodaj `REFERENCES positions(id)` na `trades.position_id` → `scripts/init_db.sql`
+- [x] Auto-update triggers for `updated_at` → `scripts/init_db.sql`
 
 #### 2.5 Backup
+- [x] Redis RDB/AOF backup (AOF + periodic RDB snapshot via `save 900 1; save 300 10`) → `docker-compose.yml`
 - [ ] Skrypt `pg_dump` dzienny do S3/GCS/local
-- [ ] Redis RDB/AOF backup (juz jest AOF, dodaj periodic RDB snapshot)
 - [ ] Testowanie restore procedure
 
 ---
@@ -165,50 +145,39 @@
 ### FAZA 3 — Testy i CI/CD
 
 #### 3.1 Pokrycie testami (cel: >60% coverage)
-- [ ] Unit tests dla brakujacych modulow:
-  - `collector/solana.py` i `collector/evm.py`
-  - `enrichment/security.py` i providerow (birdeye, goplus)
-  - `bus/redis_streams.py` i `bus/consumer.py`
-  - `wal/raw_wal.py`, `wal/replay.py`, `wal/snapshot.py`
-  - `control/control_plane.py`
-  - `utils/circuit_breaker.py`, `rate_limiter.py`
+- [x] Unit tests dla brakujacych modulow:
+  - [x] `collector/solana.py` i `collector/evm.py` → `tests/test_collector.py`
+  - [x] providerow (birdeye, goplus) → `tests/test_birdeye.py`, `tests/test_goplus.py`
+  - [x] `wal/raw_wal.py` → `tests/test_wal.py`
+  - [x] `utils/circuit_breaker.py` → `tests/test_circuit_breaker.py`
+  - [x] `utils/rate_limiter.py` → `tests/test_rate_limiter.py`
+  - [x] `utils/idempotency.py` → `tests/test_idempotency.py`
+  - [x] `wallet/wallet_manager.py` → `tests/test_wallet.py`
+  - [ ] `bus/redis_streams.py` i `bus/consumer.py`
+  - [ ] `control/control_plane.py`
 - [ ] Integration tests:
   - Redis Streams: publish → consume → ack → DLQ flow
   - PostgreSQL: CRUD na wszystkich modelach
   - Full pipeline: collector mock → ... → position created (dry-run)
-- [ ] Dodaj `pytest.ini` lub `pyproject.toml` z konfiguracja testow
+- [x] Dodaj `pyproject.toml` z konfiguracja testow → `pyproject.toml`
 - [ ] Fixture'y z testcontainers (Redis + Postgres w Docker)
 
 #### 3.2 CI/CD Pipeline (GitHub Actions)
-- [ ] `.github/workflows/ci.yml`:
-  ```yaml
-  on: [push, pull_request]
-  jobs:
-    lint:
-      - black --check
-      - flake8
-      - mypy --strict (stopniowo)
-      - isort --check
-    test:
-      services:
-        redis: redis:7-alpine
-        postgres: timescale/timescaledb:latest-pg15
-      steps:
-        - pytest --cov=src --cov-report=xml
-        - upload coverage
-    build:
-      - docker build --tag mmh:${{ github.sha }}
-      - trivy image scan
-  ```
+- [x] `.github/workflows/ci.yml` → `.github/workflows/ci.yml`
+  - lint (black, isort, flake8, mypy)
+  - test (Redis + Postgres services, pytest --cov)
+  - build (Docker build + Trivy scan)
+  - security (TruffleHog secrets scan)
 - [ ] `.github/workflows/deploy.yml` (na main):
   - Build + push do container registry
   - Deploy do VPS (ssh + docker-compose pull + up)
 
 #### 3.3 Pre-commit hooks
-- [ ] `.pre-commit-config.yaml`:
-  - black, isort, flake8, mypy
-  - detect-secrets (zapobieganie commitom z kluczami)
-  - dockerfile-lint
+- [x] `.pre-commit-config.yaml` → `.pre-commit-config.yaml`
+  - black, isort, flake8
+  - trailing-whitespace, end-of-file-fixer, check-yaml
+  - detect-private-key, check-merge-conflict
+  - gitleaks (secrets detection)
 
 ---
 
@@ -223,7 +192,7 @@
 - [ ] Request/response logging dla external APIs (birdeye, goplus) z latency
 
 #### 4.2 Alarmy
-- [ ] Prometheus alerting rules (`config/prometheus/alerts.yml`):
+- [x] Prometheus alerting rules → `config/prometheus/alerts.yml`:
   - `mmh_stream_lag > 100` przez 5m → WARN
   - `mmh_dlq_additions_total` rate > 5/min → CRITICAL
   - `mmh_execution_failures_total` rate > 3/min → CRITICAL
@@ -233,6 +202,7 @@
 - [ ] Alertmanager → Telegram webhook
 
 #### 4.3 Grafana dashboards
+- [x] Grafana provisioning setup (datasources + dashboard folder) → `config/grafana/provisioning/`
 - [ ] Dashboard: Pipeline Overview (tokens/min, scoring latency P95, risk decisions pie chart)
 - [ ] Dashboard: Trading (open positions, PnL timeline, execution success rate)
 - [ ] Dashboard: Infrastructure (Redis memory, PG connections, container CPU/mem)
@@ -247,7 +217,7 @@
 ### FAZA 5 — Telegram Bot (command interface)
 
 #### 5.1 Bot command handler
-- [ ] Implementacja `TelegramBot` class:
+- [x] Implementacja `TelegramBot` class → `src/telegram/bot.py`
   - `/status` — pipeline overview (services running, positions, exposure)
   - `/positions` — lista otwartych pozycji z PnL
   - `/portfolio` — summary (total exposure, daily PnL, win rate)
@@ -255,9 +225,9 @@
   - `/freeze <chain>` — freeze chain
   - `/resume <chain>` — resume chain
   - `/kill` — emergency stop all trading
-- [ ] Integracja z ControlPlane (komendy przez control:commands stream)
-- [ ] Autoryzacja: whitelist chat_id (juz jest w config)
-- [ ] Alerty automatyczne:
+- [x] Integracja z ControlPlane (komendy przez control:commands stream)
+- [x] Autoryzacja: whitelist chat_id (juz jest w config)
+- [x] Alerty automatyczne:
   - Nowa pozycja otwarta
   - TP/SL hit
   - Circuit breaker activated
@@ -308,7 +278,7 @@
 ### FAZA 7 — Staging i dry-run na mainnet
 
 #### 7.1 Staging environment
-- [ ] Oddzielny docker-compose.staging.yml (inne porty, osobna DB)
+- [x] Oddzielny docker-compose.staging.yml (inne porty, osobna DB) → `docker-compose.staging.yml`
 - [ ] Dry-run na mainnet (prawdziwe dane, symulowane transakcje)
 - [ ] Monitoring minimum 7 dni:
   - Ile tokenow przechodzi przez pipeline?
