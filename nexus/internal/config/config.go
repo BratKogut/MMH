@@ -140,7 +140,7 @@ func (cfg *Config) Validate() error {
 			return fmt.Errorf("config: hunter.take_profit_multiplier must be > 1.0 (got %f)", h.TakeProfitMultiplier)
 		}
 		if h.StopLossPct <= 0 || h.StopLossPct > 100 {
-			return fmt.Errorf("config: hunter.stop_loss_pct must be 0-100 (got %f)", h.StopLossPct)
+			return fmt.Errorf("config: hunter.stop_loss_pct must be >0 and <=100 (got %f)", h.StopLossPct)
 		}
 		if h.SlippageBps <= 0 || h.SlippageBps > 5000 {
 			return fmt.Errorf("config: hunter.slippage_bps must be 1-5000 (got %d)", h.SlippageBps)

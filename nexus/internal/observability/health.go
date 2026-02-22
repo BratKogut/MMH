@@ -188,9 +188,10 @@ func (m *HealthMonitor) emitAlert(name string, h ComponentHealth) {
 		Timestamp: time.Now(),
 	}
 
-	// Non-blocking send; drop if the channel is full.
+	// Non-blocking send; drop if stopped or channel is full.
 	select {
 	case m.alertCh <- alert:
+	case <-m.stopCh:
 	default:
 	}
 }

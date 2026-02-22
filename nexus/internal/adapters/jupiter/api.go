@@ -152,6 +152,7 @@ func (c *APIClient) GetQuote(ctx context.Context, params solana.SwapParams) (*Qu
 		if resp.StatusCode == 429 {
 			lastErr = fmt.Errorf("jupiter: rate limited (429)")
 			c.errorCount.Add(1)
+			c.recordError()
 			continue
 		}
 
@@ -317,6 +318,10 @@ type PriceResponse struct {
 
 // GetPrice fetches the current price for a token.
 func (c *APIClient) GetPrice(ctx context.Context, mint solana.Pubkey) (decimal.Decimal, error) {
+	if c.circuitOpen.Load() {
+		return decimal.Zero, fmt.Errorf("jupiter: circuit breaker open")
+	}
+
 	queryURL, err := url.Parse(jupiterPriceURL)
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("jupiter: parse URL: %w", err)
@@ -349,6 +354,10 @@ func (c *APIClient) GetPrice(ctx context.Context, mint solana.Pubkey) (decimal.D
 	var priceResp PriceResponse
 	if err := json.Unmarshal(body, &priceResp); err != nil {
 		return decimal.Zero, fmt.Errorf("jupiter: parse price: %w", err)
+	}
+
+	if priceResp.Data == nil {
+		return decimal.Zero, fmt.Errorf("jupiter: empty price response for %s", mint)
 	}
 
 	data, ok := priceResp.Data[string(mint)]

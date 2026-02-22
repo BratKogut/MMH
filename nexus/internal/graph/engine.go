@@ -382,10 +382,11 @@ func (e *Engine) DetectSybilCluster(wallets []string, tokenMint string, blockTim
 		return false
 	}
 
-	// Check funding tree: do these wallets share a common funder?
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	// Use write lock from the start to avoid unsafe RLock->Lock upgrade.
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
+	// Check funding tree: do these wallets share a common funder?
 	funders := make(map[string]int) // funder -> count of wallets funded
 	for _, wallet := range wallets {
 		for _, edge := range e.adjIn[wallet] {
@@ -399,9 +400,6 @@ func (e *Engine) DetectSybilCluster(wallets []string, tokenMint string, blockTim
 	threshold := len(wallets) / 2
 	for funder, count := range funders {
 		if count >= threshold {
-			// Mark entire cluster.
-			e.mu.RUnlock()
-			e.mu.Lock()
 			clusterID := e.nextCluster.Add(1)
 			for _, wallet := range wallets {
 				if node := e.nodes[wallet]; node != nil {
@@ -413,8 +411,6 @@ func (e *Engine) DetectSybilCluster(wallets []string, tokenMint string, blockTim
 				node.ClusterID = clusterID
 				e.addLabel(node, LabelSybilCluster)
 			}
-			e.mu.Unlock()
-			e.mu.RLock()
 			return true
 		}
 	}

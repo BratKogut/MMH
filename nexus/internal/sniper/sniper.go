@@ -424,34 +424,35 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 
 // executePartialSell sells a partial amount of a position.
 func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision ExitDecision) {
+	// Snapshot sell amount under lock to avoid TOCTOU race.
+	e.mu.RLock()
+	currentAmount := pos.AmountToken
+	posID := pos.ID
+	e.mu.RUnlock()
+
+	sellAmount := decision.SellAmount
+	if sellAmount.GreaterThan(currentAmount) {
+		sellAmount = currentAmount
+	}
+	if !sellAmount.IsPositive() {
+		return
+	}
+
 	log.Info().
-		Str("pos_id", pos.ID).
+		Str("pos_id", posID).
 		Str("mint", string(pos.TokenMint)).
 		Str("reason", decision.Reason).
 		Float64("sell_pct", decision.SellPct).
-		Str("sell_amount", decision.SellAmount.String()).
+		Str("sell_amount", sellAmount.String()).
 		Msg("sniper: PARTIAL SELL")
 
 	if e.config.DryRun {
 		log.Info().
-			Str("pos_id", pos.ID).
+			Str("pos_id", posID).
 			Str("reason", decision.Reason).
 			Float64("sell_pct", decision.SellPct).
 			Msg("sniper: DRY RUN partial sell")
 	} else {
-		// Validate sell amount.
-		e.mu.RLock()
-		currentAmount := pos.AmountToken
-		e.mu.RUnlock()
-
-		sellAmount := decision.SellAmount
-		if sellAmount.GreaterThan(currentAmount) {
-			sellAmount = currentAmount
-		}
-		if !sellAmount.IsPositive() {
-			return
-		}
-
 		params := solana.SwapParams{
 			InputMint:     pos.TokenMint,
 			OutputMint:    solana.SOLMint,
@@ -463,24 +464,25 @@ func (e *Engine) executePartialSell(ctx context.Context, pos *Position, decision
 
 		_, err := e.jupiter.SwapDirect(ctx, params)
 		if err != nil {
-			log.Error().Err(err).Str("pos_id", pos.ID).Str("reason", decision.Reason).Msg("sniper: partial sell FAILED")
+			log.Error().Err(err).Str("pos_id", posID).Str("reason", decision.Reason).Msg("sniper: partial sell FAILED")
 			return
 		}
 	}
 
 	// Update position token amount.
 	e.mu.Lock()
-	pos.AmountToken = pos.AmountToken.Sub(decision.SellAmount)
+	pos.AmountToken = pos.AmountToken.Sub(sellAmount)
 	if pos.AmountToken.IsNegative() {
 		pos.AmountToken = decimal.Zero
 	}
+	remaining := pos.AmountToken.String()
 	e.mu.Unlock()
 
 	e.totalSells.Add(1)
 
 	log.Info().
-		Str("pos_id", pos.ID).
-		Str("remaining", pos.AmountToken.String()).
+		Str("pos_id", posID).
+		Str("remaining", remaining).
 		Msg("sniper: partial sell completed")
 }
 
@@ -492,28 +494,37 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 		return
 	}
 	pos.Status = StatusClosing
+	posID := pos.ID
+	pnlPct := pos.PnLPct
+	costSOL := pos.CostSOL
 	e.mu.Unlock()
 
 	log.Info().
-		Str("pos_id", pos.ID).
+		Str("pos_id", posID).
 		Str("mint", string(pos.TokenMint)).
 		Str("reason", reason).
-		Float64("pnl_pct", pos.PnLPct).
+		Float64("pnl_pct", pnlPct).
 		Bool("dry_run", e.config.DryRun).
 		Msg("sniper: EXECUTING SELL")
 
 	now := time.Now()
 
 	if e.config.DryRun {
-		pos.SellSignature = solana.Signature(fmt.Sprintf("DRYRUN-SELL-%s", pos.ID))
+		e.mu.Lock()
+		pos.SellSignature = solana.Signature(fmt.Sprintf("DRYRUN-SELL-%s", posID))
+		e.mu.Unlock()
 		log.Info().
-			Str("pos_id", pos.ID).
+			Str("pos_id", posID).
 			Msg("sniper: DRY RUN sell (no real transaction)")
 	} else {
+		e.mu.RLock()
+		amountToken := pos.AmountToken
+		e.mu.RUnlock()
+
 		params := solana.SwapParams{
 			InputMint:     pos.TokenMint,
 			OutputMint:    solana.SOLMint,
-			AmountIn:      pos.AmountToken,
+			AmountIn:      amountToken,
 			SlippageBps:   e.config.SlippageBps,
 			PriorityFee:   e.config.PriorityFee,
 			UseJitoBundle: e.config.UseJito,
@@ -524,30 +535,33 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 			e.mu.Lock()
 			pos.SellRetries++
 			if pos.SellRetries >= e.config.MaxSellRetries {
-				log.Error().Err(err).Str("pos_id", pos.ID).Int("retries", pos.SellRetries).
+				log.Error().Err(err).Str("pos_id", posID).Int("retries", pos.SellRetries).
 					Msg("sniper: sell PERMANENTLY FAILED after max retries")
 				pos.Status = StatusFailed
 				pos.CloseReason = fmt.Sprintf("SELL_FAILED_%s", reason)
 				pos.ClosedAt = &now
 			} else {
-				log.Warn().Err(err).Str("pos_id", pos.ID).Int("retry", pos.SellRetries).
+				log.Warn().Err(err).Str("pos_id", posID).Int("retry", pos.SellRetries).
 					Msg("sniper: sell failed, will retry next cycle")
 				pos.Status = StatusOpen // allow retry
 			}
 			e.mu.Unlock()
 			return
 		}
+		e.mu.Lock()
 		pos.SellSignature = result.Signature
+		e.mu.Unlock()
 	}
 
 	e.mu.Lock()
 	pos.Status = StatusClosed
 	pos.ClosedAt = &now
 	pos.CloseReason = reason
+	pnlPct = pos.PnLPct // re-read under lock for accurate P&L
 
 	// Track daily loss.
-	if pos.PnLPct < 0 {
-		lossSOL := pos.CostSOL.Mul(decimal.NewFromFloat(-pos.PnLPct / 100.0))
+	if pnlPct < 0 {
+		lossSOL := costSOL.Mul(decimal.NewFromFloat(-pnlPct / 100.0))
 		e.dailyLossSOL = e.dailyLossSOL.Add(lossSOL)
 		e.lossCount.Add(1)
 	} else {
@@ -555,10 +569,13 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 	}
 
 	// Cancel CSM for this position.
-	if cancel, ok := e.csmCancel[pos.ID]; ok {
+	if cancel, ok := e.csmCancel[posID]; ok {
 		cancel()
-		delete(e.csmCancel, pos.ID)
+		delete(e.csmCancel, posID)
 	}
+
+	// Cleanup tracker to prevent memory leak.
+	delete(e.trackers, posID)
 
 	cb := e.onPositionClose
 	e.mu.Unlock()
@@ -570,10 +587,10 @@ func (e *Engine) executeSell(ctx context.Context, pos *Position, reason string) 
 	}
 
 	log.Info().
-		Str("pos_id", pos.ID).
+		Str("pos_id", posID).
 		Str("mint", string(pos.TokenMint)).
 		Str("reason", reason).
-		Float64("pnl_pct", pos.PnLPct).
+		Float64("pnl_pct", pnlPct).
 		Msg("sniper: position CLOSED")
 }
 
@@ -582,14 +599,19 @@ func (e *Engine) ForceClose(ctx context.Context) {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	e.mu.RLock()
+	// Cancel all CSMs first.
+	e.mu.Lock()
+	for posID, csmCancel := range e.csmCancel {
+		csmCancel()
+		delete(e.csmCancel, posID)
+	}
 	var openPositions []*Position
 	for _, p := range e.positions {
 		if p.Status == StatusOpen {
 			openPositions = append(openPositions, p)
 		}
 	}
-	e.mu.RUnlock()
+	e.mu.Unlock()
 
 	for _, pos := range openPositions {
 		e.executeSell(shutdownCtx, pos, "FORCE_CLOSE")

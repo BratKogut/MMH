@@ -569,12 +569,25 @@ func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-ch
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		seen := make(map[string]bool)
+		// Bounded seen map: track pool address -> first seen time.
+		// Evict entries older than 10 minutes to prevent unbounded growth.
+		const maxSeenAge = 10 * time.Minute
+		const maxSeenSize = 1000
+		seen := make(map[string]time.Time)
+		cleanupTicker := time.NewTicker(60 * time.Second)
+		defer cleanupTicker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-cleanupTicker.C:
+				cutoff := time.Now().Add(-maxSeenAge)
+				for k, t := range seen {
+					if t.Before(cutoff) {
+						delete(seen, k)
+					}
+				}
 			case <-ticker.C:
 				pools, err := c.GetRecentPools(ctx, dex, 5)
 				if err != nil {
@@ -583,10 +596,25 @@ func (c *LiveRPCClient) SubscribeNewPools(ctx context.Context, dex string) (<-ch
 				}
 				for _, pool := range pools {
 					key := string(pool.PoolAddress)
-					if key == "" || seen[key] {
+					if key == "" {
 						continue
 					}
-					seen[key] = true
+					if _, ok := seen[key]; ok {
+						continue
+					}
+					// Evict oldest if at capacity.
+					if len(seen) >= maxSeenSize {
+						var oldestKey string
+						var oldestTime time.Time
+						for k, t := range seen {
+							if oldestTime.IsZero() || t.Before(oldestTime) {
+								oldestKey = k
+								oldestTime = t
+							}
+						}
+						delete(seen, oldestKey)
+					}
+					seen[key] = time.Now()
 					select {
 					case out <- pool:
 					default:

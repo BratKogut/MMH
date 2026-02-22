@@ -48,10 +48,10 @@ func (s *StubProvider) Query(_ context.Context, _ QueryRequest) (*QueryResponse,
 		return nil, fmt.Errorf("provider %s has no responses configured", s.name)
 	}
 
-	resp := s.responses[s.idx]
-	resp.Provider = s.name
+	resp := s.responses[s.idx] // copy the struct value
+	resp.Provider = s.name     // modify the copy, not the original
 	s.idx = (s.idx + 1) % len(s.responses)
-	return &resp, nil
+	return &resp, nil // return pointer to the copy
 }
 
 // Health returns the current health status of the stub provider.
