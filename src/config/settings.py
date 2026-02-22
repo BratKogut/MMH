@@ -139,6 +139,18 @@ class MMHSettings(BaseSettings):
     telegram_chat_id: str = ""
 
     # ------------------------------------------------------------------
+    # Wallet Management (CRITICAL: keep these safe!)
+    # ------------------------------------------------------------------
+    solana_private_key: str = ""  # base58-encoded Solana keypair
+    evm_private_key: str = ""  # hex-encoded EVM private key (0x prefix)
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+    max_execution_retries: int = 2
+    execution_timeout_seconds: int = 60
+
+    # ------------------------------------------------------------------
     # Idempotency
     # ------------------------------------------------------------------
     dedup_ttl_seconds: int = 86400  # 24 h

@@ -1,0 +1,60 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache
+htmlcov
+.coverage
+*.egg-info
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.local
+.env.production
+*.key
+*.pem
+*.crt
+config/secrets.yaml
+
+# Tests (not needed in production image)
+tests/
+pytest.ini
+
+# Documentation (not needed in production image)
+docs/
+*.md
+!README.md
+
+# Nexus (Go platform - separate build)
+nexus/
+
+# Data & logs
+data/
+logs/
+*.log
+tmp/
+
+# Docker
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

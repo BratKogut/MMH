@@ -1,19 +1,24 @@
 version: '3.8'
 
+# Staging environment — same as production but with:
+# - dry_run=true (NO real trades)
+# - Mainnet data (real tokens, real prices)
+# - Resource limits matching production
+# - 7+ day soak test before go-live
+
 services:
-  # PostgreSQL 15 with TimescaleDB
   postgres:
     image: timescale/timescaledb:2.14.2-pg15
-    container_name: mmh-postgres
+    container_name: mmh-staging-postgres
     environment:
       POSTGRES_USER: mmh
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
-      POSTGRES_DB: mmh
+      POSTGRES_DB: mmh_staging
       TZ: UTC
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - staging_postgres_data:/var/lib/postgresql/data
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mmh"]
@@ -31,16 +36,15 @@ services:
         max-size: "50m"
         max-file: "5"
     networks:
-      - mmh-network
+      - mmh-staging
 
-  # Redis 7 with AOF persistence + authentication
   redis:
     image: redis:7.2-alpine
-    container_name: mmh-redis
+    container_name: mmh-staging-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
-      - redis_data:/data
+      - staging_redis_data:/data
     command: >
       redis-server
       --appendonly yes
@@ -65,80 +69,59 @@ services:
         max-size: "20m"
         max-file: "3"
     networks:
-      - mmh-network
+      - mmh-staging
 
-  # Prometheus Monitoring
   prometheus:
     image: prom/prometheus:v2.50.0
-    container_name: mmh-prometheus
+    container_name: mmh-staging-prometheus
     ports:
-      - "9090:9090"
+      - "9091:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
       - ./config/prometheus/alerts.yml:/etc/prometheus/alerts.yml
-      - prometheus_data:/prometheus
+      - staging_prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=30d'
     depends_on:
-      - mmh
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-          cpus: '0.5'
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+      - mmh-staging
     networks:
-      - mmh-network
+      - mmh-staging
 
-  # Grafana Dashboards
   grafana:
     image: grafana/grafana:10.3.1
-    container_name: mmh-grafana
+    container_name: mmh-staging-grafana
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_INSTALL_PLUGINS: redis-datasource
     volumes:
-      - grafana_data:/var/lib/grafana
+      - staging_grafana_data:/var/lib/grafana
       - ./config/grafana/provisioning:/etc/grafana/provisioning
     depends_on:
       - prometheus
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-          cpus: '0.5'
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
     networks:
-      - mmh-network
+      - mmh-staging
 
-  # MMH Application
-  mmh:
+  mmh-staging:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: mmh
+    container_name: mmh-staging
     env_file:
-      - .env
+      - .env.staging
     environment:
-      MMH_POSTGRES_DSN: postgresql://mmh:${DB_PASSWORD}@postgres:5432/mmh
+      MMH_POSTGRES_DSN: postgresql://mmh:${DB_PASSWORD}@postgres:5432/mmh_staging
       MMH_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      MMH_DRY_RUN: "true"
+      MMH_ENVIRONMENT: staging
     ports:
-      - "8000:8000"
+      - "8001:8000"
     volumes:
       - ./config:/app/config:ro
-      - mmh_data:/app/data
+      - staging_mmh_data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -155,16 +138,16 @@ services:
         max-size: "100m"
         max-file: "10"
     networks:
-      - mmh-network
+      - mmh-staging
     restart: unless-stopped
 
 volumes:
-  postgres_data:
-  redis_data:
-  prometheus_data:
-  grafana_data:
-  mmh_data:
+  staging_postgres_data:
+  staging_redis_data:
+  staging_prometheus_data:
+  staging_grafana_data:
+  staging_mmh_data:
 
 networks:
-  mmh-network:
+  mmh-staging:
     driver: bridge

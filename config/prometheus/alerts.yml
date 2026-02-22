@@ -1,0 +1,103 @@
+groups:
+  - name: mmh_critical
+    rules:
+      - alert: StreamLagHigh
+        expr: mmh_stream_lag > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream consumer lag > 100 for 5 minutes"
+          description: "Stream {{ $labels.stream }} group {{ $labels.group }} lag is {{ $value }}"
+
+      - alert: DLQRateHigh
+        expr: rate(mmh_dlq_additions_total[5m]) > 0.083
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DLQ additions rate > 5/min"
+          description: "Dead letter queue {{ $labels.source_stream }} is filling up"
+
+      - alert: ExecutionFailureRateHigh
+        expr: rate(mmh_execution_failures_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Execution failure rate > 3/min"
+          description: "Chain {{ $labels.chain }} failing with reason {{ $labels.reason }}"
+
+      - alert: CircuitBreakerOpen
+        expr: mmh_circuit_breaker_state == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker is OPEN"
+          description: "Component {{ $labels.component }} circuit breaker tripped"
+
+      - alert: ExposureNearMax
+        expr: mmh_exposure_total_usd > 450
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Portfolio exposure > 90% of $500 limit"
+          description: "Current exposure is ${{ $value }}"
+
+      - alert: SystemFrozen
+        expr: mmh_system_state == 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "System is FROZEN"
+          description: "Trading is halted - system state is frozen"
+
+      - alert: SystemKilled
+        expr: mmh_system_state == -1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "System is KILLED"
+          description: "Emergency kill activated - requires manual restart"
+
+      - alert: DailyLossLimitApproaching
+        expr: mmh_daily_pnl_usd < -160
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Daily PnL approaching loss limit"
+          description: "Daily PnL is ${{ $value }}, limit is -$200"
+
+  - name: mmh_infrastructure
+    rules:
+      - alert: HeartbeatMissing
+        expr: mmh_heartbeat_age_seconds > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Heartbeat missing for > 60s"
+          description: "Module {{ $labels.module }} last heartbeat {{ $value }}s ago"
+
+      - alert: ChainFrozen
+        expr: mmh_chain_frozen == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chain {{ $labels.chain }} is frozen"
+          description: "Trading on {{ $labels.chain }} is halted"
+
+      - alert: HighScoringLatency
+        expr: histogram_quantile(0.95, rate(mmh_scoring_latency_seconds_bucket[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scoring P95 latency > 500ms"
+          description: "Chain {{ $labels.chain }} scoring latency at {{ $value }}s"
