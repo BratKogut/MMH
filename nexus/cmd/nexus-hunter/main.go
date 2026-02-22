@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,10 +25,17 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// controlState tracks the system's operational state for the Control Plane.
+type controlState struct {
+	paused   atomic.Bool // soft pause: stop new entries, manage existing
+	killed   atomic.Bool // hard kill: close all, halt
+}
+
 func main() {
 	// 1. Parse flags.
 	configPath := flag.String("config", "config/config.yaml", "Path to configuration file")
 	stubMode := flag.Bool("stub", false, "Use stub RPC (no real Solana connection)")
+	snapshotDir := flag.String("snapshot-dir", "data/snapshots", "Directory for graph snapshots")
 	flag.Parse()
 
 	// 2. Load configuration.
@@ -40,8 +49,8 @@ func main() {
 	setupLogging(cfg.General)
 
 	log.Info().Msg("=============================================")
-	log.Info().Msg("NEXUS Memecoin Hunter - Starting")
-	log.Info().Msg("DETECT -> ANALYZE -> SNIPE -> PROFIT")
+	log.Info().Msg("NEXUS Memecoin Hunter v3.1 - Starting")
+	log.Info().Msg("DETECT -> SANITIZE -> ANALYZE -> SNIPE -> PROFIT")
 	log.Info().Msg("SAFETY > PROFIT > SPEED")
 	log.Info().Msg("=============================================")
 
@@ -66,6 +75,7 @@ func main() {
 
 	// 4. Create Solana RPC client.
 	var rpc solana.RPCClient
+	var liveRPC *solana.LiveRPCClient
 	if *stubMode {
 		rpc = solana.NewStubRPCClient()
 		log.Info().Msg("Solana RPC: STUB mode")
@@ -78,7 +88,7 @@ func main() {
 			RateLimitRPS: cfg.Solana.RateLimitRPS,
 			PrivateKey:   cfg.Solana.PrivateKey,
 		}
-		liveRPC := solana.NewLiveRPCClient(rpcConfig)
+		liveRPC = solana.NewLiveRPCClient(rpcConfig)
 		rpc = liveRPC
 		defer liveRPC.Close()
 
@@ -103,7 +113,6 @@ func main() {
 		UseJito:        cfg.Hunter.UseJito,
 		JitoTipSOL:     cfg.Hunter.JitoTipSOL,
 	}
-	// Derive wallet pubkey from config.
 	walletPub := cfg.Solana.WalletPubkey
 	if walletPub == "" && dryRun {
 		walletPub = "DRY-RUN-WALLET"
@@ -115,7 +124,31 @@ func main() {
 		log.Warn().Err(err).Msg("Jupiter adapter connection failed (continuing in degraded mode)")
 	}
 
-	// 6. Create Token Analyzer.
+	// 6a. Create Entity Graph Engine + load snapshot.
+	graphConfig := graph.DefaultConfig()
+	entityGraph := graph.NewEngine(graphConfig)
+
+	snapshotPath := filepath.Join(*snapshotDir, "entity_graph.gob")
+	if err := entityGraph.LoadSnapshot(snapshotPath); err != nil {
+		log.Warn().Err(err).Msg("Failed to load graph snapshot, starting fresh")
+	}
+	log.Info().
+		Int("max_nodes", graphConfig.MaxNodes).
+		Int("label_depth", graphConfig.LabelPropDepth).
+		Int("cex_wallets", graph.CEXWalletCount()).
+		Msg("Entity Graph Engine initialized")
+
+	// 6b. Create Pool State Manager.
+	poolState := scanner.NewPoolStateManager(scanner.DefaultPoolStateConfig(), nil)
+
+	// 6c. Create L0 Sanitizer.
+	sanitizerConfig := scanner.DefaultSanitizerConfig()
+	sanitizerConfig.MinLiquidityUSD = cfg.Hunter.MinLiquidityUSD
+	sanitizerConfig.MinQuoteReserveSOL = 1.0
+	sanitizer := scanner.NewSanitizer(sanitizerConfig, entityGraph, poolState)
+	log.Info().Msg("L0 Sanitizer initialized")
+
+	// 6d. Create Token Analyzer.
 	analyzerConfig := scanner.AnalyzerConfig{
 		MinSafetyScore:         cfg.Hunter.MinSafetyScore,
 		MaxTop10HolderPct:      50.0,
@@ -128,19 +161,11 @@ func main() {
 	}
 	analyzer := scanner.NewAnalyzer(analyzerConfig, rpc)
 
-	// 6b. Create Entity Graph Engine.
-	graphConfig := graph.DefaultConfig()
-	entityGraph := graph.NewEngine(graphConfig)
-	log.Info().
-		Int("max_nodes", graphConfig.MaxNodes).
-		Int("label_depth", graphConfig.LabelPropDepth).
-		Msg("Entity Graph Engine initialized")
-
-	// 6c. Create Sell Simulator.
+	// 6e. Create Sell Simulator.
 	sellSimulator := scanner.NewSellSimulator(rpc)
 	log.Info().Msg("Sell Simulator initialized")
 
-	// 6d. Create 5D Scorer.
+	// 6f. Create 5D Scorer.
 	scoringConfig := scanner.DefaultScoringConfig()
 	scorer := scanner.NewScorer(scoringConfig)
 	log.Info().
@@ -150,6 +175,13 @@ func main() {
 		Float64("onchain_w", scoringConfig.Weights.OnChain).
 		Float64("timing_w", scoringConfig.Weights.Timing).
 		Msg("5D Scorer initialized")
+
+	// 6g. Create Dynamic Priority Fee Estimator (non-stub only).
+	var feeEstimator *solana.PriorityFeeEstimator
+	if liveRPC != nil {
+		feeEstimator = solana.NewPriorityFeeEstimator(liveRPC)
+		log.Info().Msg("Dynamic Priority Fee Estimator initialized")
+	}
 
 	// 7. Create Sniper Engine.
 	sniperConfig := sniper.Config{
@@ -195,7 +227,10 @@ func main() {
 			Msg("[POSITION CLOSED]")
 	})
 
-	// 8. Create Token Scanner.
+	// 8. Control state.
+	ctrl := &controlState{}
+
+	// 8b. Create Token Scanner with full pipeline.
 	scannerConfig := scanner.ScannerConfig{
 		MinLiquidityUSD:    cfg.Hunter.MinLiquidityUSD,
 		MaxTokenAgeMinutes: cfg.Hunter.MaxTokenAgeMinutes,
@@ -205,16 +240,37 @@ func main() {
 		MinQuoteReserveSOL: 1.0,
 	}
 
-	// Scanner -> Analyzer -> 5D Scorer -> Sniper pipeline.
+	// Pipeline: Scanner -> L0 Sanitizer -> Analyzer -> SellSim -> EntityGraph -> 5D Scorer -> Sniper
 	tokenScanner := scanner.NewScanner(scannerConfig, rpc, func(ctx context.Context, discovery scanner.PoolDiscovery) {
+		// Check control state.
+		if ctrl.killed.Load() || ctrl.paused.Load() {
+			return
+		}
+
 		log.Info().
 			Str("pool", string(discovery.Pool.PoolAddress)).
 			Str("dex", discovery.Pool.DEX).
 			Str("liquidity", discovery.Pool.LiquidityUSD.String()).
 			Int64("latency_ms", discovery.LatencyMs).
-			Msg("[NEW POOL] Analyzing...")
+			Msg("[NEW POOL] Processing through pipeline...")
 
-		// Stage 1: Safety analysis.
+		// ── Stage 0: L0 Sanitizer (<10ms, ZERO external calls) ──
+		sanitizerResult := sanitizer.Check(discovery)
+		if !sanitizerResult.Passed {
+			log.Debug().
+				Str("pool", string(discovery.Pool.PoolAddress)).
+				Str("reason", sanitizerResult.Reason).
+				Str("filter", sanitizerResult.Filter).
+				Int64("latency_us", sanitizerResult.LatencyUs).
+				Msg("[L0 DROP]")
+			return
+		}
+		log.Debug().
+			Str("pool", string(discovery.Pool.PoolAddress)).
+			Int64("latency_us", sanitizerResult.LatencyUs).
+			Msg("[L0 PASS]")
+
+		// ── Stage 1: Safety analysis ──
 		analysis := analyzer.Analyze(ctx, discovery)
 
 		log.Info().
@@ -223,7 +279,7 @@ func main() {
 			Str("verdict", string(analysis.Verdict)).
 			Msg("[ANALYSIS] Safety result")
 
-		// Stage 2: Pre-buy sell simulation.
+		// ── Stage 2: Pre-buy sell simulation ──
 		preBuySim := sellSimulator.SimulatePreBuy(ctx,
 			decimal.NewFromFloat(cfg.Hunter.MaxBuySOL), discovery.Pool)
 
@@ -233,7 +289,7 @@ func main() {
 			Float64("tax_pct", preBuySim.EstimatedTaxPct).
 			Msg("[SELLSIM] Pre-buy result")
 
-		// Stage 3: Entity graph query.
+		// ── Stage 3: Entity graph query ──
 		var entityReport *graph.EntityReport
 		if discovery.Pool.TokenMint != "" {
 			report := entityGraph.QueryDeployer(string(discovery.Pool.TokenMint))
@@ -242,10 +298,11 @@ func main() {
 				Str("mint", string(analysis.Mint)).
 				Float64("risk", report.RiskScore).
 				Int("hops_rugger", report.HopsToRugger).
+				Int("cluster_size", report.ClusterSize).
 				Msg("[ENTITY] Deployer report")
 		}
 
-		// Stage 4: 5-Dimensional scoring.
+		// ── Stage 4: 5-Dimensional scoring ──
 		scoringInput := scanner.ScoringInput{
 			Analysis:     analysis,
 			EntityReport: entityReport,
@@ -266,7 +323,7 @@ func main() {
 			Bool("instant_kill", tokenScore.InstantKill).
 			Msg("[5D SCORE] Result")
 
-		// Stage 5: Apply 5D score to sniper decision.
+		// ── Stage 5: Decision ──
 		if tokenScore.InstantKill {
 			log.Warn().
 				Str("mint", string(analysis.Mint)).
@@ -280,6 +337,12 @@ func main() {
 				Str("mint", string(analysis.Mint)).
 				Str("recommendation", tokenScore.Recommendation).
 				Msg("[SKIP] Score too low")
+			return
+		}
+
+		// Re-check control state before execution.
+		if ctrl.killed.Load() || ctrl.paused.Load() {
+			log.Info().Str("mint", string(analysis.Mint)).Msg("[SKIP] System paused/killed")
 			return
 		}
 
@@ -302,6 +365,23 @@ func main() {
 	// 10. Start services.
 	var wg sync.WaitGroup
 
+	// Start graph snapshot loop.
+	graphStopCh := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		entityGraph.SnapshotLoop(snapshotPath, 5*time.Minute, graphStopCh)
+	}()
+
+	// Start priority fee estimator (non-stub only).
+	if feeEstimator != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			feeEstimator.Start(ctx)
+		}()
+	}
+
 	// Start scanner.
 	wg.Add(1)
 	go func() {
@@ -311,45 +391,106 @@ func main() {
 		}
 	}()
 
-	// Start HTTP health/stats endpoint.
+	// Start HTTP health/stats/control endpoint.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		mux := http.NewServeMux()
 
+		// ── Health ──
 		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"status":"ok","dry_run":%t}`, dryRun)
+			json.NewEncoder(w).Encode(map[string]any{
+				"status":  "ok",
+				"dry_run": dryRun,
+				"paused":  ctrl.paused.Load(),
+				"killed":  ctrl.killed.Load(),
+			})
 		})
 
+		// ── Stats ──
 		mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
-			sniperStats := sniperEngine.Stats()
-			scannerStats := tokenScanner.Stats()
-			jupStats := jupAdapter.Stats()
-			graphStats := entityGraph.Stats()
-
 			combined := map[string]any{
-				"sniper":  sniperStats,
-				"scanner": scannerStats,
-				"jupiter": jupStats,
-				"graph":   graphStats,
-				"dry_run": dryRun,
+				"sniper":    sniperEngine.Stats(),
+				"scanner":   tokenScanner.Stats(),
+				"jupiter":   jupAdapter.Stats(),
+				"graph":     entityGraph.Stats(),
+				"sanitizer": sanitizer.Stats(),
+				"dry_run":   dryRun,
+				"paused":    ctrl.paused.Load(),
+				"killed":    ctrl.killed.Load(),
 			}
-
+			if feeEstimator != nil {
+				combined["priority_fees"] = feeEstimator.Stats()
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(combined)
 		})
 
+		// ── Positions ──
 		mux.HandleFunc("/positions", func(w http.ResponseWriter, _ *http.Request) {
-			positions := sniperEngine.Positions()
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(positions)
+			json.NewEncoder(w).Encode(sniperEngine.Positions())
+		})
+		mux.HandleFunc("/positions/open", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sniperEngine.OpenPositions())
 		})
 
-		mux.HandleFunc("/positions/open", func(w http.ResponseWriter, _ *http.Request) {
-			positions := sniperEngine.OpenPositions()
+		// ── Control Plane ──
+		mux.HandleFunc("/control/pause", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", http.StatusMethodNotAllowed)
+				return
+			}
+			ctrl.paused.Store(true)
+			log.Warn().Msg("[CONTROL] System PAUSED - no new entries")
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(positions)
+			fmt.Fprintf(w, `{"status":"paused"}`)
+		})
+
+		mux.HandleFunc("/control/resume", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", http.StatusMethodNotAllowed)
+				return
+			}
+			ctrl.paused.Store(false)
+			ctrl.killed.Store(false)
+			log.Info().Msg("[CONTROL] System RESUMED")
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"status":"running"}`)
+		})
+
+		mux.HandleFunc("/control/kill", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", http.StatusMethodNotAllowed)
+				return
+			}
+			ctrl.killed.Store(true)
+			ctrl.paused.Store(true)
+			log.Error().Msg("[CONTROL] KILL SWITCH - closing all positions")
+
+			// Force close all positions.
+			go func() {
+				killCtx, killCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				sniperEngine.ForceClose(killCtx)
+				killCancel()
+			}()
+
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"status":"killed","action":"force_close_all"}`)
+		})
+
+		mux.HandleFunc("/control/status", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"paused":         ctrl.paused.Load(),
+				"killed":         ctrl.killed.Load(),
+				"dry_run":        dryRun,
+				"open_positions": len(sniperEngine.OpenPositions()),
+				"instance_id":    cfg.General.InstanceID,
+				"graph_snapshot": graph.GetSnapshotInfo(snapshotPath),
+			})
 		})
 
 		port := cfg.Metrics.PrometheusPort + 2 // hunter on port +2
@@ -360,7 +501,7 @@ func main() {
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 
-		log.Info().Str("addr", addr).Msg("Hunter HTTP server started")
+		log.Info().Str("addr", addr).Msg("Hunter HTTP server started (health + stats + control)")
 
 		go func() {
 			<-ctx.Done()
@@ -387,21 +528,47 @@ func main() {
 			case <-ticker.C:
 				ss := sniperEngine.Stats()
 				sc := tokenScanner.Stats()
-				log.Info().
+				sanStats := sanitizer.Stats()
+				logEvt := log.Info().
 					Int64("pools_scanned", sc.PoolsScanned).
 					Int64("pools_accepted", sc.PoolsAccepted).
+					Int64("l0_checked", sanStats.TotalChecked).
+					Int64("l0_passed", sanStats.TotalPassed).
+					Float64("l0_pass_rate", sanStats.PassRate).
 					Int64("snipes", ss.TotalSnipes).
 					Int("open_pos", ss.OpenPositions).
 					Int64("wins", ss.WinCount).
 					Int64("losses", ss.LossCount).
 					Float64("win_rate", ss.WinRate).
 					Str("daily_spent", ss.DailySpentSOL).
-					Msg("[STATS]")
+					Bool("paused", ctrl.paused.Load())
+				if feeEstimator != nil {
+					feeStats := feeEstimator.Stats()
+					logEvt = logEvt.Uint64("fee_p75", feeStats.P75Lamports)
+				}
+				logEvt.Msg("[STATS]")
 			}
 		}
 	}()
 
-	log.Info().Msg("NEXUS Memecoin Hunter - Running")
+	// Periodic sanitizer cleanup.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sanitizer.CleanupDeployerHistory()
+			}
+		}
+	}()
+
+	log.Info().Msg("NEXUS Memecoin Hunter v3.1 - Running")
+	log.Info().Msg("Pipeline: Pool -> L0 Sanitizer -> Analyzer -> SellSim -> Entity Graph -> 5D Scorer -> Sniper")
 	log.Info().Msg("Monitoring for new memecoin pools...")
 
 	// 11. Block until shutdown.
@@ -409,6 +576,14 @@ func main() {
 
 	// 12. Graceful shutdown.
 	log.Info().Msg("Shutting down Hunter...")
+
+	// Stop graph snapshot loop (triggers final save).
+	close(graphStopCh)
+
+	// Stop fee estimator.
+	if feeEstimator != nil {
+		feeEstimator.Stop()
+	}
 
 	// Force close all open positions with timeout.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -420,6 +595,7 @@ func main() {
 
 	// Final stats.
 	finalStats := sniperEngine.Stats()
+	sanStats := sanitizer.Stats()
 	log.Info().
 		Int64("total_snipes", finalStats.TotalSnipes).
 		Int64("total_sells", finalStats.TotalSells).
@@ -427,6 +603,9 @@ func main() {
 		Int64("losses", finalStats.LossCount).
 		Float64("win_rate", finalStats.WinRate).
 		Str("daily_spent", finalStats.DailySpentSOL).
+		Int64("l0_checked", sanStats.TotalChecked).
+		Int64("l0_passed", sanStats.TotalPassed).
+		Float64("l0_pass_rate", sanStats.PassRate).
 		Msg("NEXUS Memecoin Hunter - Final Statistics")
 
 	log.Info().Msg("NEXUS Memecoin Hunter - Shutdown complete")

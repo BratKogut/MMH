@@ -45,14 +45,32 @@ type JitoConfig struct {
 	TimeoutMs     int             `yaml:"timeout_ms"`
 }
 
+// Dynamic Jito tip constants.
+const (
+	JitoTipBaseline    = 0.005 // SOL - normal conditions
+	JitoTipCompetitive = 0.01  // SOL - high demand
+	JitoTipCeiling     = 0.02  // SOL - hard max (never exceed)
+)
+
 // DefaultJitoConfig returns production defaults.
 func DefaultJitoConfig() JitoConfig {
 	return JitoConfig{
 		Enabled:        false,
 		BlockEngineURL: jitoMainnetURL,
-		TipSOL:         decimal.NewFromFloat(0.001), // 0.001 SOL tip
+		TipSOL:         decimal.NewFromFloat(JitoTipBaseline),
 		MaxBundles:     5,
 		TimeoutMs:      5000,
+	}
+}
+
+// DynamicTip returns an adaptive Jito tip based on congestion level.
+// Baseline: 0.005 SOL, Competitive: 0.01 SOL, Ceiling: 0.02 SOL.
+func DynamicTip(congestion CongestionLevel) decimal.Decimal {
+	switch congestion {
+	case CongestionHigh:
+		return decimal.NewFromFloat(JitoTipCompetitive)
+	default:
+		return decimal.NewFromFloat(JitoTipBaseline)
 	}
 }
 
