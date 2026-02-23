@@ -1,39 +1,30 @@
-# Contributing to Multi-Chain Memecoin Hunter
-
-Thank you for your interest in contributing! This document provides guidelines and instructions for contributing to the project.
+# Contributing to NEXUS Memecoin Hunter
 
 ## Code of Conduct
 
 - Be respectful and inclusive
 - Focus on the code, not the person
 - Help others learn and grow
-- Report issues responsibly
 
 ## Getting Started
 
 ### Prerequisites
 
-- Python 3.11+
+- Go 1.24+
 - Git
-- Redis 7.0+
-- PostgreSQL 15+
 
 ### Setup Development Environment
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/multichain-memecoin-hunter.git
-cd multichain-memecoin-hunter
+git clone https://github.com/BratKogut/MMH.git
+cd MMH/nexus
 
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Build all binaries
+go build -o bin/ ./cmd/...
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install pre-commit hooks
-pre-commit install
+# Run tests
+go test -race -count=1 ./...
 ```
 
 ## Development Workflow
@@ -41,38 +32,39 @@ pre-commit install
 ### 1. Create a Branch
 
 ```bash
-# Create feature branch
 git checkout -b feature/your-feature-name
-
 # Or bugfix branch
 git checkout -b bugfix/issue-description
 ```
 
 ### 2. Make Changes
 
-- Write clean, readable code
-- Follow PEP 8 style guide
-- Add type hints
-- Include docstrings
+- Write clean, readable Go code
+- Follow Go conventions (gofmt, golint)
 - Write tests for new functionality
+- Keep functions focused and small
 
 ### 3. Code Style
 
 **Format code:**
 ```bash
-black src/ tests/
-isort src/ tests/
+gofmt -w .
 ```
 
-**Check style:**
+**Run linter:**
 ```bash
-flake8 src/ tests/
-mypy src/
+golangci-lint run ./...
 ```
 
 **Run tests:**
 ```bash
-pytest tests/ -v --cov=src/
+go test -race -count=1 ./...
+```
+
+**Run tests with coverage:**
+```bash
+go test -race -coverprofile=coverage.out ./...
+go tool cover -html=coverage.out
 ```
 
 ### 4. Commit Messages
@@ -91,12 +83,11 @@ chore: update dependencies
 
 Example:
 ```
-feat: add Arbitrum adapter
+feat: add holder exodus detection to CSM
 
-- Implement ArbitrumAdapter class
-- Add Camelot DEX support
-- Add Flashbots MEV protection
-- Add tests for Arbitrum adapter
+- Monitor top-10 holders for mass selling
+- Trigger panic sell on exodus > 30% threshold
+- Add tests for holder exodus detection
 ```
 
 ### 5. Push and Create Pull Request
@@ -105,254 +96,142 @@ feat: add Arbitrum adapter
 git push origin feature/your-feature-name
 ```
 
-Then create a PR on GitHub with:
+Create a PR with:
 - Clear title and description
 - Link to related issues
-- Screenshots/examples if applicable
 - Test results
+
+## Project Structure
+
+```
+nexus/
+├── cmd/                    # Entry points (nexus-hunter, nexus-core, nexus-intel)
+├── internal/
+│   ├── scanner/            # Token Scanner + Analyzer + 5D Scoring + SellSim + Adaptive
+│   ├── sniper/             # Sniper Engine + CSM + Exit Engine
+│   ├── graph/              # Entity Graph Engine
+│   ├── liquidity/          # Liquidity Flow Direction Analysis
+│   ├── narrative/          # Narrative Momentum Engine
+│   ├── honeypot/           # Honeypot Evolution Tracker
+│   ├── correlation/        # Cross-Token Correlation Detector
+│   ├── copytrade/          # Copy-Trade Intelligence
+│   ├── solana/             # RPC + WebSocket + Jito + priority fees
+│   ├── adapters/           # Exchange adapters (Jupiter, Kraken, Binance)
+│   ├── bus/                # Kafka/RedPanda event streaming
+│   ├── clickhouse/         # Analytics writer
+│   ├── execution/          # Order engine + state machine
+│   ├── risk/               # Risk engine
+│   ├── intel/              # LLM intelligence pipeline
+│   ├── config/             # YAML configuration
+│   └── observability/      # Prometheus + health
+└── docs/                   # Documentation
+```
 
 ## Testing
 
 ### Unit Tests
 
 ```bash
-pytest tests/test_adapters.py -v
-pytest tests/test_scoring.py -v
-pytest tests/test_execution.py -v
+# Run all tests
+go test -race -count=1 ./...
+
+# Run specific package tests
+go test -race ./internal/scanner/...
+go test -race ./internal/sniper/...
+go test -race ./internal/graph/...
 ```
 
-### Integration Tests
+### Test Coverage
 
 ```bash
-pytest tests/integration/ -v
+go test -race -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
 ```
 
-### Coverage
+**Current status:** 497 tests passing, ~34,000 LOC
 
-```bash
-pytest --cov=src/ --cov-report=html
+## Coding Standards
+
+### Go Style
+
+- Use `gofmt` for formatting
+- Follow [Effective Go](https://go.dev/doc/effective_go)
+- Use meaningful variable names
+- Keep functions under 50 lines where possible
+- Use interfaces for testability
+
+### Error Handling
+
+```go
+result, err := someFunction()
+if err != nil {
+    return fmt.Errorf("context: %w", err)
+}
 ```
 
-### Async Tests
+### Logging
 
-```bash
-pytest tests/test_async.py -v -s
+```go
+log.Printf("[MODULE] Action: %s result=%v", param, result)
 ```
 
-## Documentation
+### Testing
 
-### Adding Documentation
+```go
+func TestFeature_Scenario(t *testing.T) {
+    // Arrange
+    input := setupTestData()
 
-1. Update relevant `.md` files in `docs/`
-2. Add docstrings to code
-3. Update README if needed
-4. Include examples
+    // Act
+    result := functionUnderTest(input)
 
-### Docstring Format
-
-```python
-def function_name(param1: str, param2: int) -> bool:
-    """
-    Brief description of what the function does.
-    
-    Longer description if needed, explaining the logic,
-    edge cases, or important details.
-    
-    Args:
-        param1: Description of param1
-        param2: Description of param2
-    
-    Returns:
-        Description of return value
-    
-    Raises:
-        ValueError: When something is invalid
-        RuntimeError: When something goes wrong
-    
-    Example:
-        >>> result = function_name("test", 42)
-        >>> print(result)
-        True
-    """
-    pass
+    // Assert
+    if result != expected {
+        t.Errorf("expected %v, got %v", expected, result)
+    }
+}
 ```
 
 ## Types of Contributions
 
 ### Bug Reports
-
 1. Check if issue already exists
 2. Provide minimal reproducible example
-3. Include system information
+3. Include Go version and OS
 4. Describe expected vs actual behavior
 
 ### Feature Requests
-
 1. Describe the use case
 2. Explain why it's needed
-3. Provide examples
-4. Discuss implementation approach
-
-### Documentation
-
-- Fix typos
-- Clarify confusing sections
-- Add examples
-- Improve API documentation
+3. Discuss implementation approach
 
 ### Code Improvements
-
-- Refactoring
+- Bug fixes
 - Performance optimization
-- Better error handling
 - Test coverage
-
-## Pull Request Process
-
-1. **Before submitting:**
-   - Run tests: `pytest`
-   - Check style: `black`, `flake8`, `mypy`
-   - Update documentation
-   - Add changelog entry
-
-2. **PR Description:**
-   - What does this PR do?
-   - Why is it needed?
-   - How to test it?
-   - Any breaking changes?
-
-3. **Review process:**
-   - Maintainers will review
-   - May request changes
-   - Be responsive to feedback
-   - Address all comments
-
-4. **Merge:**
-   - Squash commits if needed
-   - Update CHANGELOG
-   - Close related issues
-
-## Project Structure
-
-```
-src/
-├── adapters/          # Chain adapters (Solana, Base, etc.)
-├── services/          # Core services (Scoring, Execution, etc.)
-├── models/            # Data models and types
-└── main.py            # Entry point
-
-tests/
-├── test_adapters.py
-├── test_scoring.py
-├── test_execution.py
-└── integration/       # Integration tests
-
-docs/
-├── 01-architecture-solana.md
-├── 02-base-adapter.md
-├── 03-scoring-execution.md
-└── API_REFERENCE.md
-```
-
-## Coding Standards
-
-### Python Style
-
-- Use type hints
-- Follow PEP 8
-- Max line length: 100
-- Use async/await for I/O
-
-### Error Handling
-
-```python
-try:
-    result = await api_call()
-except SpecificError as e:
-    logger.error(f"Specific error: {e}")
-    raise
-except Exception as e:
-    logger.error(f"Unexpected error: {e}")
-    raise
-```
-
-### Logging
-
-```python
-import logging
-
-logger = logging.getLogger(__name__)
-
-logger.debug("Debug message")
-logger.info("Info message")
-logger.warning("Warning message")
-logger.error("Error message")
-```
-
-### Testing
-
-```python
-@pytest.mark.asyncio
-async def test_adapter_initialization():
-    """Test that adapter initializes correctly."""
-    adapter = SolanaAdapter(config)
-    assert adapter.chain == ChainId.SOLANA
-    
-    await adapter.start()
-    assert adapter._ws is not None
-    
-    await adapter.stop()
-```
+- Documentation
 
 ## Security
 
 ### Reporting Security Issues
 
-**DO NOT** open a public issue for security vulnerabilities.
-
-Instead:
-1. Email security@example.com
-2. Include detailed description
-3. Provide proof of concept if possible
-4. Allow time for fix before disclosure
+Do NOT open a public issue for security vulnerabilities. Report privately.
 
 ### Security Guidelines
 
-- Never commit API keys or secrets
-- Use environment variables
-- Validate all inputs
-- Sanitize error messages
+- Never commit API keys or private keys
+- Use YAML config files with .gitignore
+- Validate all external inputs
 - Use HTTPS for all connections
-- Keep dependencies updated
 
-## Performance Considerations
+## Pull Request Process
 
-- Use async/await for I/O
-- Cache when appropriate
-- Minimize API calls
-- Use connection pooling
-- Monitor resource usage
+1. Run tests: `go test -race ./...`
+2. Format code: `gofmt -w .`
+3. Update documentation if needed
+4. Create PR with clear description
+5. Address review feedback
 
-## Release Process
+---
 
-1. Update version in `__init__.py`
-2. Update CHANGELOG.md
-3. Create release notes
-4. Tag release: `git tag v1.0.0`
-5. Push tag: `git push origin v1.0.0`
-
-## Questions?
-
-- Check existing issues/discussions
-- Read documentation
-- Ask in discussions
-- Open an issue
-
-## Recognition
-
-Contributors will be recognized in:
-- CONTRIBUTORS.md
-- Release notes
-- GitHub contributors page
-
-Thank you for contributing! 🎉
+*Last Updated: 2026-02-23*

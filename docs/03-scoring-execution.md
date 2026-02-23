@@ -1,334 +1,379 @@
-# MULTI-CHAIN MEMECOIN HUNTER v2.0 — Part 3/3
-## Scoring + Execution + Infrastructure + Roadmap
+# NEXUS Memecoin Hunter v3.2 — Scoring & Execution
 
 ---
 
-## 7. CONSUMER GROUPS & RELIABILITY
+## 1. 5-Dimensional Scoring System
 
-```python
-# Setup (run once at startup):
-streams_and_groups = {
-    "tokens:new:solana": ["scoring_group", "alert_group"],
-    "tokens:new:base":   ["scoring_group", "alert_group"],
-    "scoring:results":   ["executor_group", "alert_group"],
-    "trades:executed:solana": ["position_group"],
-    "trades:executed:base":   ["position_group"],
-}
-# XGROUP CREATE for each
+### Overview
 
-# Consumer pattern: Read → Process → XACK
-# If handler fails N times → send to dlq:{stream}
-# Pending messages re-processed on restart via XREADGROUP with id="0"
+The scorer evaluates tokens across 5 dimensions, each capturing a different aspect of risk and opportunity. Weights are adaptive and adjust based on trade outcomes.
+
+### Dimensions
+
+| # | Dimension | Default Weight | What It Measures |
+|---|-----------|---------------|------------------|
+| 1 | Safety | 30% | Token contract safety (mint/freeze authority, LP burn, holder concentration, sell simulation) |
+| 2 | Entity | 15% | Deployer wallet risk (graph analysis, Sybil clusters, hops to known ruggers) |
+| 3 | Social | 20% | Narrative momentum (meme lifecycle phase, token count trends, velocity) |
+| 4 | OnChain | 20% | On-chain activity (liquidity flow patterns, copy-trade signals) |
+| 5 | Timing | 15% | Entry timing (pool age, narrative alignment, copy-trade tier) |
+
+### Scoring Formula
+
+```
+Total = (Safety × w_safety) + (Entity × w_entity) + (Social × w_social)
+      + (OnChain × w_onchain) + (Timing × w_timing) + CorrelationBonus
 ```
 
----
+Where `w_*` are adaptive weights (default: 0.30, 0.15, 0.20, 0.20, 0.15).
 
-## 8. SCORING SERVICE
+### Input Data
 
-### Chain-Specific Weights
-
-```python
-CHAIN_SCORING = {
-    "solana": {
-        "lp_burned": 0.20,
-        "holder_distribution": 0.20,
-        "creator_history": 0.15,
-        "pump_fun_graduation": 0.15,
-        "volume_organic": 0.15,
-        "bonding_curve_momentum": 0.15,  # NEW: pre-graduation signal
-    },
-    "base": {
-        "honeypot_check": 0.25,          # GoPlus critical
-        "lp_locked": 0.20,
-        "holder_distribution": 0.20,
-        "contract_verified": 0.10,
-        "liquidity_depth": 0.15,
-        "tax_level": 0.10,
-    },
-    "bsc": {
-        "honeypot_check": 0.30,          # Highest — BSC has most scams
-        "lp_locked": 0.20,
-        "holder_distribution": 0.15,
-        "pinksale_audit": 0.15,
-        "contract_verified": 0.10,
-        "tax_level": 0.10,
-    },
-    "ton": {
-        "lp_locked": 0.25,
-        "holder_distribution": 0.25,
-        "jetton_compliant": 0.20,
-        "creator_history": 0.15,
-        "telegram_presence": 0.15,
-    },
+```go
+type ScoringInput struct {
+    Analysis        TokenAnalysis              // from Token Analyzer
+    EntityReport    *graph.EntityReport        // from Entity Graph Engine
+    SellSim         *SellSimResult             // from Sell Simulator
+    LiquidityFlow   *liquidity.LiquidityFlow   // from Liquidity Flow Analyzer [v3.2]
+    NarrativeState  *narrative.NarrativeState   // from Narrative Engine [v3.2]
+    CrossTokenState *correlation.CrossTokenState // from Correlation Detector [v3.2]
+    HoneypotMatch   *honeypot.Signature         // from Honeypot Tracker [v3.2]
+    CopyTradeSignal *copytrade.CopySignal       // from Copy-Trade Tracker [v3.2]
 }
 ```
 
 ### Output
 
-```python
-@dataclass
-class TokenScore:
-    chain: ChainId
-    address: str
-    risk_score: int         # 0-100 (higher = SAFER)
-    momentum_score: int     # 0-100 
-    overall_score: int
-    flags: list[str]
-    recommendation: str     # STRONG_BUY | BUY | WATCH | AVOID
+```go
+type TokenScore struct {
+    Total            int     // 0-100, weighted composite
+    Safety           int     // 0-100
+    Entity           int     // 0-100
+    Social           int     // 0-100
+    OnChain          int     // 0-100
+    Timing           int     // 0-100
+    CorrelationBonus int     // -20 to +20
+    CorrelationType  string  // bonus source
+    Recommendation   string  // STRONG_BUY | BUY | WAIT | SKIP | RUG | HONEYPOT
+    InstantKill      bool    // if true, score=0
+    KillReason       string  // reason for instant kill
+    Reasons          []string // human-readable scoring reasons
+}
+```
+
+### Recommendations
+
+| Score Range | Recommendation | Action |
+|-------------|---------------|--------|
+| >= 75 | STRONG_BUY | Auto-snipe |
+| 60-74 | BUY | Auto-snipe (if enabled) |
+| 45-59 | WAIT | Monitor, don't buy |
+| < 45 | SKIP | Reject |
+| InstantKill | RUG / HONEYPOT | Reject immediately |
+
+---
+
+## 2. v3.2 Instant-Kill Conditions
+
+Before dimension scoring, three instant-kill checks run. If any triggers, score is set to 0 and token is rejected.
+
+### Honeypot High Confidence
+```
+IF HoneypotMatch != nil AND HoneypotMatch.Confidence >= 0.7:
+    InstantKill = true
+    KillReason = "HONEYPOT_HIGH_CONFIDENCE"
+    Recommendation = "HONEYPOT"
+```
+
+### Rug Precursor
+```
+IF LiquidityFlow != nil AND LiquidityFlow.Pattern == RUG_PRECURSOR:
+    InstantKill = true
+    KillReason = "RUG_PRECURSOR"
+    Recommendation = "RUG"
+```
+
+### Cross-Token Critical
+```
+IF CrossTokenState != nil AND CrossTokenState.RiskLevel == CRITICAL:
+    InstantKill = true
+    KillReason = "CROSS_TOKEN_CRITICAL"
+    Recommendation = "RUG"
 ```
 
 ---
 
-## 9. EXECUTION SERVICE
+## 3. v3.2 Score Adjustments
 
-### Trade Flow
+After base dimension scoring, v3.2 modules adjust individual dimension scores.
+
+### Liquidity Flow Impact (affects Safety)
+- HEALTHY_GROWTH: +10 safety
+- SLOW_BLEED: -15 safety
+- ARTIFICIAL_PUMP: -10 safety
+
+### Narrative Phase Impact (affects Timing)
+- EMERGING + ACCELERATING: +15 timing
+- GROWING: +5 timing
+- DECLINING: -10 timing
+- DEAD: -20 timing
+
+### Cross-Token Correlation Impact (affects Entity)
+- HIGH risk: -10 entity
+- MEDIUM risk: -5 entity
+- Also sets CorrelationBonus (negative)
+
+### Honeypot Partial Match (affects Safety)
+- Confidence 0.3-0.7: safety penalty proportional to confidence
+- Below 0.3: no impact (too uncertain)
+
+### Copy-Trade Signal Impact (affects OnChain)
+- FIRST_MOVE by WHALE/SMART_MONEY: +15 onchain
+- ACCUMULATE: +10 onchain
+- DUMP: -20 onchain
+
+---
+
+## 4. Adaptive Scoring Weights
+
+### How It Works
+
+The AdaptiveWeightEngine learns from trade outcomes:
+
+1. **Record**: On position close, `RecordOutcome(TradeOutcome)` saves the entry dimension scores + PnL
+2. **Analyze**: Every 30 minutes, correlate each dimension's score with win/loss outcomes
+3. **Adjust**: Increase weight for dimensions that predict winners, decrease for dimensions that don't
+4. **Apply**: Update scorer weights via `SetWeights()` (thread-safe)
+
+### Configuration
+
+```go
+AdaptiveWeightConfig{
+    LearningRate:    0.05,  // max weight change per recalculation
+    WindowSize:      50,    // number of recent trades to analyze
+    RecalcInterval:  30min, // how often to recalculate
+}
+```
+
+### TradeOutcome
+
+```go
+type TradeOutcome struct {
+    Score      TokenScore  // full 5D score at entry
+    PnLPct     float64     // profit/loss percentage
+    IsWin      bool        // PnL > 0
+    IsRug      bool        // detected as rug/scam
+    Duration   time.Duration
+    RecordedAt time.Time
+}
+```
+
+### Constraints
+- Weights always sum to 1.0
+- Minimum weight per dimension: 0.05
+- Maximum weight per dimension: 0.50
+- Changes capped by LearningRate per cycle
+
+---
+
+## 5. Execution Engine
+
+### Sniper Engine Decision Flow
 
 ```
-scoring:results (STRONG_BUY) → EXECUTION SERVICE:
-  1. Validate score (still STRONG_BUY?)
-  2. Check balance (enough SOL/ETH?)
-  3. Check position (not already holding?)
-  4. FRESH security check (pre-execution, bypasses cache)
-  5. Size position (risk-based)
-  6. Execute swap (via chain adapter)
-  7. Create position (Position Manager)
-  8. Set TP/SL (auto stop-loss)
+OnDiscovery(ctx, analysis):
+    │
+    ├── Check: ctrl.paused or ctrl.killed → SKIP
+    ├── Check: dailySpentSOL >= MaxDailySpendSOL → SKIP
+    ├── Check: dailyLossSOL >= MaxDailyLossSOL → SKIP
+    ├── Check: len(positions) >= MaxPositions → SKIP
+    ├── Check: analysis.SafetyScore < MinSafetyScore → SKIP
+    ├── Check: TokenScore.Recommendation not in (STRONG_BUY, BUY) → SKIP
+    └── All pass → ExecuteBuy()
+```
+
+### Buy Execution
+
+```
+ExecuteBuy(ctx, analysis):
+    1. Get Jupiter V6 quote
+       - inputMint: SOL (WSOL)
+       - outputMint: token
+       - amount: MaxBuySOL in lamports
+       - slippageBps: from config (default 200)
+
+    2. Get swap TX from Jupiter
+       - dynamicComputeUnitLimit: true
+       - dynamicSlippage: true
+       - priorityFee: dynamic estimation
+
+    3. If UseJito:
+       - Add Jito tip instruction to TX
+       - Tip amount: dynamic (config JitoTipSOL as base)
+
+    4. Sign TX with wallet private key
+
+    5. Submit:
+       - If UseJito: via Jito bundle endpoint
+       - Else: via standard RPC sendTransaction
+
+    6. Wait for confirmation (finalized)
+
+    7. Create Position:
+       - ID, TokenMint, PoolAddress, DEX
+       - EntryPriceUSD, AmountToken, CostSOL
+       - SafetyScore, BuySignature
+       - Status: OPEN
+
+    8. Start CSM goroutine for this position
+
+    9. Wire CSM with EntityGraph + HoneypotTracker (v3.2)
+
+    10. Cache entry scores for adaptive weights
+```
+
+### Sell Execution
+
+```
+ExecuteSell(ctx, position, reason):
+    1. Get Jupiter V6 quote (reverse: token → SOL)
+
+    2. Build sell TX
+
+    3. Sign + submit (with retry up to SellRetries)
+
+    4. Update position:
+       - Status: CLOSED
+       - CloseReason: reason
+       - PnLPct: calculated from entry/exit
+       - SellSignature: TX hash
+
+    5. Trigger onPositionClose callback
 ```
 
 ### Position Sizing
 
-```python
-SIZING = {
-    ("STRONG_BUY", "solana"): {"base_usd": 50, "max_usd": 100},
-    ("BUY",        "solana"): {"base_usd": 25, "max_usd": 50},
-    ("STRONG_BUY", "base"):   {"base_usd": 30, "max_usd": 80},
-    ("BUY",        "base"):   {"base_usd": 15, "max_usd": 40},
+Currently fixed at `MaxBuySOL` per trade (configured in YAML, default 0.1 SOL).
+
+Global safety limits:
+- `MaxDailySpendSOL` — total SOL spent per day
+- `MaxDailyLossSOL` — max cumulative loss per day
+- `MaxPositions` — max concurrent open positions (default 5)
+
+---
+
+## 6. CSM — Continuous Safety Monitor
+
+### Purpose
+
+Post-buy protection. A goroutine runs for each open position, continuously re-evaluating safety.
+
+### Checks
+
+| Check | Interval | Panic Condition |
+|-------|----------|-----------------|
+| Sell Simulation | 30s | CanSell = false OR tax > MaxSellTaxPct |
+| Holder Exodus | 30s | Top-N holders lost > HolderExodusPanicPct |
+| Liquidity Health | 30s | Liquidity dropped > LiquidityDropPanicPct |
+| Entity Re-Check | 60s | Deployer risk >= EntityRiskPanicScore |
+
+### Panic Sell
+
+When any check triggers panic:
+1. Force sell entire position immediately
+2. Set CloseReason to specific CSM reason
+3. Position Close triggers rug feedback loop
+
+### CSM Close Reasons
+
+| Reason | Description |
+|--------|-------------|
+| CSM_SELL_SIM_FAILED | Sell simulation detected honeypot post-buy |
+| CSM_LIQUIDITY_PANIC | Liquidity dropped below panic threshold |
+| CSM_HOLDER_EXODUS | Top holders dumping massively |
+| CSM_ENTITY_SERIAL_RUGGER | Deployer flagged as serial rugger |
+
+---
+
+## 7. Exit Engine
+
+### Multi-Level Take Profit
+
+The exit engine supports 4 configurable TP levels with partial sells:
+
+```go
+ExitConfig{
+    TPLevels: []TPLevel{
+        {Multiplier: 1.5, SellPct: 25},  // sell 25% at 1.5x
+        {Multiplier: 2.0, SellPct: 25},  // sell 25% at 2x
+        {Multiplier: 3.0, SellPct: 25},  // sell 25% at 3x
+        {Multiplier: 6.0, SellPct: 100}, // sell remaining at 6x
+    },
+    StopLossPct:    50,  // -50% from entry
+    TrailingStop: TrailingStopConfig{
+        Enabled: true,
+        Pct:     20,     // 20% from highest
+    },
+    TimedExits: []TimedExit{
+        {AfterMinutes: 240,  SellPct: 50},  // 4h: sell 50%
+        {AfterMinutes: 720,  SellPct: 75},  // 12h: sell 75%
+        {AfterMinutes: 1440, SellPct: 100}, // 24h: sell all
+    },
+    PanicLiqDropPct:   50,
+    PanicWhaleSellSOL: 100,
 }
-
-# Global safety:
-MAX_PORTFOLIO_EXPOSURE = 500   # USD total open
-MAX_POSITIONS_PER_CHAIN = 5
-MAX_SINGLE_POSITION_PCT = 20   # % of portfolio
 ```
 
-### MEV Protection
+### Exit Priority (highest to lowest)
 
-| Chain | Method | Detail |
-|-------|--------|--------|
-| Solana | **Jito Bundles** | Private mempool via `mainnet.block-engine.jito.wtf` |
-| Base | **Low priority** | L2 = minimal MEV, use standard send |
-| BSC | **None** | Public mempool, high slippage + fast exec |
-| Arbitrum | **Flashbots** | Flashbots Protect RPC |
+1. **Panic** — CSM triggers (immediate)
+2. **Stop Loss** — price below threshold (immediate)
+3. **Take Profit** — price above TP level (partial sell)
+4. **Trailing Stop** — price dropped from high (close all)
+5. **Timed Exit** — holding too long (partial/full sell)
 
 ---
 
-## 10. POSITION MANAGER
+## 8. Rug Feedback Loop
 
-```python
-@dataclass
-class Position:
-    id: str
-    chain: ChainId
-    token_address: str
-    token_symbol: str
-    entry_price: float
-    entry_timestamp: float
-    entry_tx_hash: str
-    amount_tokens: int
+When a position closes as a rug, the system learns:
 
-    take_profit_levels: list = field(default_factory=lambda: [50, 100, 200])  # %
-    stop_loss_pct: float = -30
-    trailing_stop_pct: float = 0       # 0 = disabled
-    max_holding_seconds: int = 3600    # 1h default
-    status: str = "OPEN"               # OPEN | PARTIAL_EXIT | CLOSED
+### Honeypot Learning
+```go
+honeypotTracker.RecordRug(honeypot.RugSample{
+    TokenAddress:  mint,
+    Chain:         "solana",
+    DeployerAddr:  deployer,
+    ContractData:  contractBytes,
+    RugType:       "RUG_DETECTED",
+    DetectedBy:    closeReason,
+    Timestamp:     time.Now(),
+})
 ```
+- Extracts new honeypot signatures from contract data
+- Updates pattern database
+- Triggers retroactive scan of open positions
+
+### Correlation Learning
+```go
+correlationDetector.MarkRugged(clusterID, mint)
+```
+- Updates cluster risk level (may promote to CRITICAL)
+- Future tokens from same cluster get penalized or instant-killed
+
+### Adaptive Weight Update
+```go
+adaptiveWeights.RecordOutcome(TradeOutcome{
+    Score:  entryScore,   // full 5D scores at time of entry
+    PnLPct: position.PnLPct,
+    IsWin:  false,
+    IsRug:  true,
+})
+```
+- Feeds into weight recalculation
+- If safety dimension was high but token rugged: safety weight increases
+- If entity dimension was low and token rugged: entity weight increases
 
 ---
 
-## 11. INFRASTRUCTURE
-
-### Rate Limiters
-
-```python
-RATE_LIMITS = {
-    "birdeye":     1.0,   # calls/sec (~60/min)
-    "goplus":      0.5,   # 30/min
-    "basescan":    5.0,   # 5/sec
-    "helius":      10.0,  # plan-based
-    "dexscreener": 5.0,   # generous
-}
-# Token bucket implementation with asyncio lock
-```
-
-### Retry Logic
-
-```python
-# Exponential backoff decorator for all API calls:
-# Attempt 1: immediate
-# Attempt 2: wait 1s
-# Attempt 3: wait 2s
-# Attempt 4: wait 4s (max 30s)
-```
-
----
-
-## 12. DATABASE SCHEMA
-
-```sql
--- PostgreSQL 15 + TimescaleDB
-
-CREATE TABLE tokens (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chain VARCHAR(20) NOT NULL,
-    address VARCHAR(100) NOT NULL,
-    symbol VARCHAR(50), name VARCHAR(200),
-    creator_address VARCHAR(100),
-    launchpad VARCHAR(50), dex VARCHAR(50),
-    pool_address VARCHAR(100),
-    discovered_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(chain, address)
-);
-
-CREATE TABLE token_scores (
-    token_id UUID REFERENCES tokens(id),
-    scored_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    risk_score SMALLINT, momentum_score SMALLINT, overall_score SMALLINT,
-    flags JSONB, recommendation VARCHAR(20),
-    PRIMARY KEY (token_id, scored_at)
-);
-SELECT create_hypertable('token_scores', 'scored_at');
-
-CREATE TABLE positions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chain VARCHAR(20) NOT NULL,
-    token_address VARCHAR(100) NOT NULL, token_symbol VARCHAR(50),
-    entry_price DECIMAL(30,18), entry_amount DECIMAL(30,18),
-    entry_timestamp TIMESTAMPTZ, entry_tx_hash VARCHAR(100),
-    exit_price DECIMAL(30,18), exit_timestamp TIMESTAMPTZ,
-    take_profit_levels JSONB DEFAULT '[50,100,200]',
-    stop_loss_pct DECIMAL(10,4) DEFAULT -30,
-    status VARCHAR(20) DEFAULT 'OPEN',
-    pnl_usd DECIMAL(20,2), pnl_pct DECIMAL(10,4)
-);
-
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    position_id UUID REFERENCES positions(id),
-    chain VARCHAR(20), tx_hash VARCHAR(100),
-    tx_type VARCHAR(20),  -- BUY, SELL, PARTIAL_SELL
-    amount_in DECIMAL(30,18), amount_out DECIMAL(30,18),
-    price DECIMAL(30,18), gas_cost_usd DECIMAL(10,4),
-    executed_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
----
-
-## 13. KOSZTY — REALISTYCZNY BUDŻET
-
-### MVP (Solana + Base)
-
-| Provider | Plan | $/mo | Użycie |
-|----------|------|------|--------|
-| Helius | Business | $199 | RPC+WS+Webhooks+DAS |
-| Alchemy (Base) | Growth | $49 | RPC+WS |
-| Birdeye | Standard | $99 | Security+OHLCV+Overview |
-| PumpPortal | Free | $0 | pump.fun WS data |
-| GoPlus | Free | $0 | Base/BSC security |
-| DexScreener | Free | $0 | Pair data |
-| Jupiter | Free | $0 | Solana swaps |
-| 0x | Free tier | $0 | Base quotes |
-| Basescan | Free | $0 | Contract verification |
-| Jito | Free | $0 | MEV protection (tip in TX) |
-| VPS (Hetzner AX41) | 64GB RAM | $45 | All services |
-| **TOTAL** | | **~$392/mo** | |
-
-### Per additional chain
-
-| Chain | Provider | Extra $/mo |
-|-------|----------|-----------|
-| BSC | NodeReal/Ankr | $0-50 |
-| TON | TON Center | $0-30 |
-| Arbitrum | Alchemy (included) | $0 |
-| Tron | TronGrid | $0-30 |
-
----
-
-## 14. API QUICK REFERENCE
-
-| Service | URL | Auth | Limit |
-|---------|-----|------|-------|
-| Helius RPC | `https://mainnet.helius-rpc.com/?api-key={K}` | URL | plan |
-| Helius WS | `wss://mainnet.helius-rpc.com/?api-key={K}` | URL | plan |
-| Helius Webhooks | `https://api.helius.xyz/v0/webhooks?api-key={K}` | URL | plan |
-| PumpPortal WS | `wss://pumpportal.fun/api/data` | none | rate-limited |
-| PumpPortal Trade | `https://pumpportal.fun/api/trade-local` | none | 0.5% fee |
-| Jupiter Quote | `https://quote-api.jup.ag/v6/quote` | none | unlimited |
-| Jupiter Swap | `https://quote-api.jup.ag/v6/swap` | none | unlimited |
-| Jupiter Price | `https://price.jup.ag/v6/price` | none | unlimited |
-| Birdeye | `https://public-api.birdeye.so/defi/*` | X-API-KEY | plan |
-| Jito | `https://mainnet.block-engine.jito.wtf/api/v1/transactions` | none | unlimited |
-| Alchemy RPC | `https://base-mainnet.g.alchemy.com/v2/{K}` | URL | plan |
-| Alchemy WS | `wss://base-mainnet.g.alchemy.com/v2/{K}` | URL | plan |
-| GoPlus | `https://api.gopluslabs.io/api/v1/token_security/{CID}` | none | 30/min |
-| Basescan | `https://api.basescan.org/api` | apikey | 5/sec |
-| 0x | `https://base.api.0x.org/swap/v1/*` | 0x-api-key | 100k/mo |
-| DexScreener | `https://api.dexscreener.com/latest/dex/tokens/{A}` | none | unlimited |
-
----
-
-## 15. ROADMAP
-
-### Phase 1 — MVP (2-3 tygodnie)
-
-```
-WEEK 1:
-  ☐ SolanaAdapter — PumpPortal WS (new tokens + migrations)
-  ☐ SolanaAdapter — Helius WS fallback (Raydium + Orca)
-  ☐ SolanaAdapter — Security (on-chain + Birdeye)
-  ☐ Redis Streams + consumer groups
-
-WEEK 2:
-  ☐ BaseAdapter — WS (Uniswap V3 + Aerodrome PoolCreated)
-  ☐ BaseAdapter — Security (GoPlus)
-  ☐ Basic Scoring (risk + momentum)
-  ☐ Telegram alerts
-
-WEEK 3:
-  ☐ Jupiter swap execution (Solana)
-  ☐ Uniswap V3 swap execution (Base)
-  ☐ Two-level security (pre-filter + pre-execution)
-  ☐ Circuit breaker + exponential backoff
-  ☐ PostgreSQL + position tracking
-```
-
-### Phase 2 — Semi-Auto (2 tygodnie)
-
-```
-  ☐ Telegram buy/sell commands
-  ☐ Position Manager (TP/SL monitoring)
-  ☐ Auto stop-loss
-  ☐ Portfolio summary (Telegram)
-  ☐ Dead letter queue
-  ☐ Grafana dashboard
-```
-
-### Phase 3 — Expansion (2-3 tygodnie)
-
-```
-  ☐ BSC adapter (PancakeSwap)
-  ☐ TON adapter (STON.fi / DeDust)
-  ☐ Cross-chain portfolio
-  ☐ Advanced scoring (wallet analysis, social)
-  ☐ Bonding curve sniper (buy on curve, sell on graduation)
-```
-
-### Phase 4 — Hardening (ongoing)
-
-```
-  ☐ Arbitrum + Tron adapters
-  ☐ Full auto mode + risk limits
-  ☐ React web dashboard
-  ☐ Backtesting engine
-  ☐ ML-based scoring
-```
+*Last Updated: 2026-02-23*

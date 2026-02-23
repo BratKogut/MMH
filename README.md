@@ -1,505 +1,237 @@
-# Multi-Chain Memecoin Hunter v2.0
+# NEXUS Memecoin Hunter v3.2
 
-**SAFETY > PROFIT**
+**SAFETY > PROFIT > SPEED**
 
-An advanced, production-ready system for automated detection, security analysis, and trading of memecoins across multiple blockchain networks.
+A high-performance Solana memecoin detection, analysis, and sniping engine built on the NEXUS platform. Written in Go 1.24 with an event-driven architecture, 5-dimensional scoring, and self-learning feedback loops.
 
-## 🎯 Project Overview
+## Overview
 
-Multi-Chain Memecoin Hunter v2.0 is a sophisticated trading bot that:
+NEXUS Memecoin Hunter is a production-grade trading system that:
 
-- **Detects** new memecoins across Solana, Base, BSC, TON, Arbitrum, and Tron
-- **Analyzes** security with two-level checks (pre-filter cache + pre-execution fresh)
-- **Scores** tokens using chain-specific weighted algorithms
-- **Executes** trades with MEV protection and risk management
-- **Manages** positions with automated TP/SL and portfolio limits
-- **Monitors** health with Prometheus metrics and Telegram alerts
+- **Detects** new pools on Raydium and pump.fun via WebSocket monitoring
+- **Sanitizes** with sub-10ms L0 filter (zero external calls)
+- **Analyzes** token safety, sell simulation, deployer entity graph, liquidity flows, narrative momentum, honeypot patterns, cross-token correlations, and copy-trade signals
+- **Scores** tokens across 5 dimensions with adaptive weights that learn from outcomes
+- **Snipes** via Jupiter V6 with Jito MEV protection and dynamic priority fees
+- **Monitors** positions with Continuous Safety Monitor (CSM) per position
+- **Exits** with multi-level take profit, trailing stops, and panic sells
 
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ CHAIN ADAPTERS (Solana, Base, BSC, TON, Arbitrum, Tron)   │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-┌────────────────────▼────────────────────────────────────────┐
-│ REDIS STREAMS (per-chain event bus)                         │
-│ - tokens:new:{chain}                                        │
-│ - trades:executed:{chain}                                   │
-│ - health:*                                                  │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┐
-        │            │            │
-    ┌───▼────┐  ┌───▼──────┐  ┌──▼──────────┐
-    │SCORING │  │EXECUTION │  │ POSITION    │
-    │SERVICE │  │SERVICE   │  │ MANAGER     │
-    └────────┘  └──────────┘  └─────────────┘
-        │            │            │
-        └────────────┼────────────┘
-                     │
-        ┌────────────▼────────────┐
-        │ PostgreSQL + TimescaleDB│
-        │ Grafana + Prometheus    │
-        │ Telegram Alerts         │
-        └─────────────────────────┘
-```
-
-## 🚀 Key Features
-
-### Security First
-- **Two-level security checks**: Pre-filter (cached) + Pre-execution (fresh)
-- **Circuit breaker pattern**: Protects against cascading failures
-- **Portfolio limits**: MAX_EXPOSURE, MAX_PER_CHAIN, MAX_SINGLE_POSITION
-- **Fresh security validation**: Always verified before execution
-
-### Multi-Chain Support
-- **Solana**: pump.fun, PumpSwap, Raydium, Orca
-- **Base**: Uniswap V3, Aerodrome
-- **BSC**: PancakeSwap (Phase 3)
-- **TON**: STON.fi, DeDust (Phase 3)
-- **Arbitrum**: Camelot, Uniswap V3 (Phase 4)
-- **Tron**: SunSwap, SunPump (Phase 4)
-
-### Reliability
-- **Consumer groups + DLQ**: Message reliability with dead letter queues
-- **Exponential backoff**: Smart retry logic with max delays
-- **Health checks**: Real-time monitoring via Prometheus
-- **Graceful degradation**: Fallback mechanisms for API failures
-
-### Scalability
-- **Redis Streams**: Efficient event processing
-- **TimescaleDB**: Time-series data with automatic compression
-- **Async/await**: Non-blocking I/O throughout
-- **Modular adapters**: Easy to extend with new chains
-
-## 📊 Supported Chains & DEXs
-
-| Chain | DEXs | Status |
-|-------|------|--------|
-| **Solana** | pump.fun, Raydium, Orca, PumpSwap | ✅ Phase 1 |
-| **Base** | Uniswap V3, Aerodrome | ✅ Phase 1 |
-| **BSC** | PancakeSwap | 📅 Phase 3 |
-| **TON** | STON.fi, DeDust | 📅 Phase 3 |
-| **Arbitrum** | Camelot, Uniswap V3 | 📅 Phase 4 |
-| **Tron** | SunSwap, SunPump | 📅 Phase 4 |
-
-## 💰 Token Discovery Layers
-
-### Solana (3-Layer System)
-
-**Layer 1: PumpPortal WebSocket** (~200ms, ~70% coverage)
-- Real-time new token creation events
-- Bonding curve trades
-- Migration (graduation) tracking
-- Free tier available
-
-**Layer 2: Helius Webhooks** (HTTP push with auto-retry)
-- Raydium V4 pool creation
-- Orca Whirlpool monitoring
-- Reliable delivery with automatic retries
-
-**Layer 3: Helius WebSocket** (Fallback)
-- Raydium logs subscription
-- Orca logs subscription
-- Wallet account changes
-- TX confirmation tracking
-
-### Base (WebSocket Monitoring)
-
-- **Uniswap V3 PoolCreated** logs
-- **Aerodrome V2 PoolCreated** logs
-- Automatic new token identification
-- Liquidity depth tracking
-
-## 🔒 Security Analysis
-
-### Two-Level Approach
-
-**Pre-Filter (Cached)**
-- TTL-based cache (30 seconds)
-- Fast initial validation
-- Reduces API calls
-
-**Pre-Execution (Fresh)**
-- Always fresh check before trade
-- Bypasses cache
-- Protects against last-minute changes
-
-### Solana Security Checks
-
-1. **On-Chain (Helius)**
-   - Mint authority status
-   - Freeze authority status
-   - Token metadata
-
-2. **Birdeye Security API**
-   - `isMintable`: Can infinite tokens be minted?
-   - `isFreezable`: Can tokens be frozen?
-   - `top10HolderPercent`: Concentration risk
-   - `lpBurnedPercent`: LP burn status
-
-3. **Birdeye Overview**
-   - Price, volume, liquidity
-   - Buy/sell ratio
-   - Holder count
-
-### Base Security Checks
-
-1. **GoPlus Security API**
-   - Honeypot detection
-   - Mintable status
-   - Owner drain capability
-   - Hidden owner detection
-   - Self-destruct flag
-   - Transfer pausable status
-   - Buy/sell tax levels
-   - Proxy upgrade status
-
-2. **Basescan Verification** (optional)
-   - Contract source code verification
-   - ABI availability
-
-## 📈 Scoring System
-
-### Chain-Specific Weights
-
-**Solana**
-- LP Burned: 20%
-- Holder Distribution: 20%
-- Creator History: 15%
-- Pump.fun Graduation: 15%
-- Organic Volume: 15%
-- Bonding Curve Momentum: 15%
-
-**Base**
-- Honeypot Check: 25%
-- LP Locked: 20%
-- Holder Distribution: 20%
-- Contract Verified: 10%
-- Liquidity Depth: 15%
-- Tax Level: 10%
-
-**BSC**
-- Honeypot Check: 30%
-- LP Locked: 20%
-- Holder Distribution: 15%
-- PinkSale Audit: 15%
-- Contract Verified: 10%
-- Tax Level: 10%
-
-### Output
-
-```python
-@dataclass
-class TokenScore:
-    chain: ChainId
-    address: str
-    risk_score: int         # 0-100 (higher = safer)
-    momentum_score: int     # 0-100 
-    overall_score: int
-    flags: list[str]
-    recommendation: str     # STRONG_BUY | BUY | WATCH | AVOID
-```
-
-## ⚙️ Execution Engine
-
-### Trade Flow
+## Architecture
 
 ```
-scoring:results (STRONG_BUY) → EXECUTION SERVICE:
-  1. Validate score (still STRONG_BUY?)
-  2. Check balance (enough SOL/ETH?)
-  3. Check position (not already holding?)
-  4. FRESH security check (pre-execution, bypasses cache)
-  5. Size position (risk-based)
-  6. Execute swap (via chain adapter)
-  7. Create position (Position Manager)
-  8. Set TP/SL (auto stop-loss)
+Pool Discovery (WebSocket)
+    |
+    v
+L0 Sanitizer (<10ms, zero external calls)
+    |
+    v
+Token Analyzer (safety, liquidity, holders)
+    |
+    v
+Sell Simulator (pre-buy honeypot detection)
+    |
+    v
+Entity Graph Engine (deployer risk, Sybil detection)
+    |
+    v
+v3.2 Advanced Analysis
+  |- Liquidity Flow Direction (RUG_PRECURSOR detection)
+  |- Narrative Momentum (EMERGING -> DEAD lifecycle)
+  |- Honeypot Evolution Tracker (pattern learning)
+  |- Cross-Token Correlation (rotation/serial/distraction)
+  |- Copy-Trade Intelligence (whale/smart-money signals)
+    |
+    v
+5D Scorer (Safety 30% + Entity 15% + Social 20% + OnChain 20% + Timing 15%)
+  + Adaptive Weights (recalculated every 30min from trade outcomes)
+    |
+    v
+Sniper Engine (Jupiter V6 + Jito bundles)
+    |
+    v
+CSM + Exit Engine (per-position goroutine)
+    |
+    v
+Position Close -> Outcome Feed -> Adaptive Recalculation
 ```
 
-### Position Sizing
+## Key Features
 
-```python
-SIZING = {
-    ("STRONG_BUY", "solana"): {"base_usd": 50, "max_usd": 100},
-    ("BUY",        "solana"): {"base_usd": 25, "max_usd": 50},
-    ("STRONG_BUY", "base"):   {"base_usd": 30, "max_usd": 80},
-    ("BUY",        "base"):   {"base_usd": 15, "max_usd": 40},
-}
+### 5-Dimensional Scoring
+- **Safety (30%)**: Mint/freeze authority, LP burn, holder concentration
+- **Entity (15%)**: Deployer wallet graph, Sybil clusters, hops to known ruggers
+- **Social (20%)**: Narrative phase, velocity, token count trends
+- **On-Chain (20%)**: Liquidity flow patterns, organic vs artificial volume
+- **Timing (15%)**: Pool age, narrative alignment, copy-trade signals
 
-# Global limits:
-MAX_PORTFOLIO_EXPOSURE = 500   # USD total open
-MAX_POSITIONS_PER_CHAIN = 5
-MAX_SINGLE_POSITION_PCT = 20   # % of portfolio
-```
+### v3.2 Advanced Analysis Modules
+- **Liquidity Flow Direction**: Detects RUG_PRECURSOR, ARTIFICIAL_PUMP, SLOW_BLEED patterns
+- **Narrative Momentum**: Tracks meme narrative lifecycle (EMERGING -> GROWING -> PEAK -> DECLINING -> DEAD)
+- **Honeypot Evolution**: SHA256 fingerprinting of contract patterns, learns from rugs
+- **Cross-Token Correlation**: Detects ROTATION, DISTRACTION, and SERIAL scam patterns
+- **Copy-Trade Intelligence**: Whale/smart-money/KOL wallet tracking with signal generation
+- **Adaptive Scoring Weights**: Self-learning system that adjusts 5D weights from trade outcomes
 
-### MEV Protection
+### Continuous Safety Monitor (CSM)
+Per-position goroutine that runs every 30 seconds:
+- Sell simulation re-check (honeypot detection post-buy)
+- Holder exodus detection (top-10 holders dumping)
+- Liquidity health monitoring
+- Entity graph re-check (deployer turned serial rugger)
 
-| Chain | Method | Detail |
-|-------|--------|--------|
-| **Solana** | Jito Bundles | Private mempool via `mainnet.block-engine.jito.wtf` |
-| **Base** | Low priority | L2 = minimal MEV, standard send |
-| **BSC** | None | Public mempool, high slippage + fast exec |
-| **Arbitrum** | Flashbots | Flashbots Protect RPC |
+### Multi-Level Exit Engine
+- **Take Profit**: 4 levels with partial sells (1.5x/25%, 2x/25%, 3x/25%, 6x/100%)
+- **Stop Loss**: -50% from entry
+- **Trailing Stop**: 20% from highest price
+- **Timed Exits**: 4h/50%, 12h/75%, 24h/100%
+- **Panic Exits**: CSM triggers (sell sim failed, liquidity drop, holder exodus)
 
-## 📊 Position Management
+### Self-Learning Feedback Loop
+On position close:
+1. TradeOutcome records PnL + dimension scores at entry
+2. AdaptiveWeightEngine adjusts scoring weights based on win/loss correlation
+3. If rug detected: honeypot tracker learns new patterns, correlation detector marks cluster
 
-```python
-@dataclass
-class Position:
-    id: str
-    chain: ChainId
-    token_address: str
-    token_symbol: str
-    entry_price: float
-    entry_timestamp: float
-    entry_tx_hash: str
-    amount_tokens: int
-    
-    take_profit_levels: list = [50, 100, 200]  # %
-    stop_loss_pct: float = -30
-    trailing_stop_pct: float = 0       # 0 = disabled
-    max_holding_seconds: int = 3600    # 1h default
-    status: str = "OPEN"               # OPEN | PARTIAL_EXIT | CLOSED
-```
+## Tech Stack
 
-## 💾 Database Schema
+- **Language**: Go 1.24
+- **Event Bus**: Kafka/RedPanda (franz-go client)
+- **Analytics**: ClickHouse (batch writer)
+- **Blockchain**: Solana RPC + WebSocket
+- **DEX**: Jupiter V6 API (quote/swap/price)
+- **MEV Protection**: Jito Bundles
+- **Monitoring**: Prometheus metrics + health endpoints
+- **Configuration**: YAML with runtime validation
 
-### PostgreSQL 15 + TimescaleDB
-
-**Tokens Table**
-- Chain, address, symbol, name
-- Creator, launchpad, DEX, pool
-- Discovery timestamp
-
-**Token Scores Hypertable**
-- Risk score, momentum score, overall score
-- Flags, recommendation
-- Scored timestamp (for time-series)
-
-**Positions Table**
-- Entry/exit price, amount, timestamp
-- TX hash, TP/SL levels
-- Status, P&L tracking
-
-**Transactions Table**
-- Position reference
-- Buy/sell/partial-sell
-- Amount in/out, price, gas cost
-- Execution timestamp
-
-## 💰 Cost Breakdown (MVP)
-
-### Solana + Base
-
-| Provider | Plan | $/mo | Usage |
-|----------|------|------|-------|
-| Helius | Business | $199 | RPC+WS+Webhooks+DAS |
-| Alchemy (Base) | Growth | $49 | RPC+WS |
-| Birdeye | Standard | $99 | Security+OHLCV+Overview |
-| PumpPortal | Free | $0 | pump.fun WS data |
-| GoPlus | Free | $0 | Base/BSC security |
-| DexScreener | Free | $0 | Pair data |
-| Jupiter | Free | $0 | Solana swaps |
-| 0x | Free tier | $0 | Base quotes |
-| Basescan | Free | $0 | Contract verification |
-| Jito | Free | $0 | MEV protection (tip in TX) |
-| VPS (Hetzner AX41) | 64GB RAM | $45 | All services |
-| **TOTAL** | | **~$392/mo** | |
-
-### Additional Chains
-
-| Chain | Provider | Extra $/mo |
-|-------|----------|-----------|
-| BSC | NodeReal/Ankr | $0-50 |
-| TON | TON Center | $0-30 |
-| Arbitrum | Alchemy (included) | $0 |
-| Tron | TronGrid | $0-30 |
-
-## 📅 Roadmap
-
-### Phase 1 — MVP (2-3 weeks)
-
-**Week 1**
-- ☐ SolanaAdapter — PumpPortal WS (new tokens + migrations)
-- ☐ SolanaAdapter — Helius WS fallback (Raydium + Orca)
-- ☐ SolanaAdapter — Security (on-chain + Birdeye)
-- ☐ Redis Streams + consumer groups
-
-**Week 2**
-- ☐ BaseAdapter — WS (Uniswap V3 + Aerodrome PoolCreated)
-- ☐ BaseAdapter — Security (GoPlus)
-- ☐ Basic Scoring (risk + momentum)
-- ☐ Telegram alerts
-
-**Week 3**
-- ☐ Jupiter swap execution (Solana)
-- ☐ Uniswap V3 swap execution (Base)
-- ☐ Two-level security (pre-filter + pre-execution)
-- ☐ Circuit breaker + exponential backoff
-- ☐ PostgreSQL + position tracking
-
-### Phase 2 — Semi-Auto (2 weeks)
-
-- ☐ Telegram buy/sell commands
-- ☐ Position Manager (TP/SL monitoring)
-- ☐ Auto stop-loss
-- ☐ Portfolio summary (Telegram)
-- ☐ Dead letter queue
-- ☐ Grafana dashboard
-
-### Phase 3 — Expansion (2-3 weeks)
-
-- ☐ BSC adapter (PancakeSwap)
-- ☐ TON adapter (STON.fi / DeDust)
-- ☐ Cross-chain portfolio
-- ☐ Advanced scoring (wallet analysis, social)
-- ☐ Bonding curve sniper
-
-### Phase 4 — Hardening (ongoing)
-
-- ☐ Arbitrum + Tron adapters
-- ☐ Full auto mode + risk limits
-- ☐ React web dashboard
-- ☐ Backtesting engine
-- ☐ ML-based scoring
-
-## 🛠️ Tech Stack
-
-- **Language**: Python 3.11+
-- **Async**: asyncio, aiohttp
-- **Blockchain**: web3.py, solders (Solana)
-- **Database**: PostgreSQL 15 + TimescaleDB
-- **Cache/Streams**: Redis
-- **Monitoring**: Prometheus + Grafana
-- **Notifications**: Telegram Bot API
-- **APIs**: Helius, Alchemy, Birdeye, GoPlus, Jupiter, 0x, DexScreener
-
-## 📁 Project Structure
+## Project Structure
 
 ```
-multichain-memecoin-hunter/
-├── README.md
-├── docs/
-│   ├── 01-architecture-solana.md
-│   ├── 02-base-adapter.md
-│   ├── 03-scoring-execution.md
-│   ├── API_REFERENCE.md
-│   ├── DEPLOYMENT.md
-│   └── TROUBLESHOOTING.md
-├── src/
-│   ├── __init__.py
-│   ├── main.py
-│   ├── config.py
-│   ├── adapters/
-│   │   ├── __init__.py
-│   │   ├── base.py
-│   │   ├── solana_adapter.py
-│   │   ├── base_adapter.py
-│   │   └── [other chains]
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── scoring_service.py
-│   │   ├── execution_service.py
-│   │   ├── position_manager.py
-│   │   └── alerts_service.py
-│   └── models/
-│       ├── __init__.py
-│       ├── types.py
-│       ├── security.py
-│       └── position.py
-├── tests/
-│   ├── __init__.py
-│   ├── test_adapters.py
-│   ├── test_scoring.py
-│   ├── test_execution.py
-│   └── test_security.py
-├── config/
-│   ├── config.example.yaml
-│   ├── scoring_weights.yaml
-│   └── position_sizing.yaml
-├── scripts/
-│   ├── setup_redis.sh
-│   ├── setup_postgres.sh
-│   ├── setup_monitoring.sh
-│   └── backtest.py
-├── requirements.txt
-├── docker-compose.yml
-├── .gitignore
-└── LICENSE
+nexus/
+├── cmd/
+│   ├── nexus-core/      # Market data + Kafka producer + ClickHouse writer
+│   ├── nexus-intel/     # LLM intelligence pipeline
+│   └── nexus-hunter/    # Memecoin hunter (main binary)
+│
+├── internal/
+│   ├── scanner/         # Token Scanner + Analyzer + 5D Scoring + Sell Sim + Adaptive Weights
+│   ├── sniper/          # Sniper Engine + CSM + Exit Engine
+│   ├── graph/           # Entity Graph (wallet clustering, Sybil detection)
+│   ├── liquidity/       # Liquidity Flow Direction Analysis
+│   ├── narrative/       # Narrative Momentum Engine
+│   ├── honeypot/        # Honeypot Evolution Tracker
+│   ├── correlation/     # Cross-Token Correlation Detector
+│   ├── copytrade/       # Copy-Trade Intelligence
+│   ├── solana/          # RPC client + WebSocket monitor + Jito + priority fees
+│   ├── adapters/        # Exchange adapters (Jupiter, Kraken, Binance)
+│   ├── bus/             # Kafka/RedPanda event streaming
+│   ├── clickhouse/      # Analytics database writer
+│   ├── execution/       # Order engine + state machine + position manager
+│   ├── risk/            # Risk veto guardian
+│   ├── intel/           # Brain + TriggerEngine + IntelService
+│   ├── config/          # YAML configuration
+│   └── observability/   # Prometheus metrics + health
+│
+├── go.mod
+└── Makefile
 ```
 
-## 🚀 Quick Start
+## Binaries
+
+| Binary | Purpose |
+|--------|---------|
+| `nexus-hunter` | Memecoin sniping engine (main focus) |
+| `nexus-core` | Market data aggregation (Kraken/Binance -> Kafka -> ClickHouse) |
+| `nexus-intel` | LLM intelligence pipeline |
+
+## HTTP API (nexus-hunter, port 9092)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health status (dry_run, paused, killed) |
+| `/stats` | GET | Combined stats from all modules |
+| `/positions` | GET | All positions (open + closed) |
+| `/positions/open` | GET | Currently open positions |
+| `/control/pause` | POST | Soft pause (stop new entries) |
+| `/control/resume` | POST | Resume from pause |
+| `/control/kill` | POST | Hard kill (force close all) |
+| `/control/status` | GET | Current state |
+| `/copytrade/wallets` | GET | List tracked wallets |
+| `/copytrade/wallets` | POST | Add tracked wallet |
+| `/copytrade/wallets` | DELETE | Remove tracked wallet |
+
+## Configuration
+
+```yaml
+general:
+  instance_id: "nexus-1"
+  environment: "development"
+  dry_run: true
+
+solana:
+  rpc_endpoint: "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+  ws_endpoint: "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+  private_key: "base58_private_key"
+  rate_limit_rps: 10
+
+hunter:
+  enabled: true
+  dry_run: true
+  monitor_dexes: ["raydium", "pumpfun"]
+  max_buy_sol: 0.1
+  slippage_bps: 200
+  max_positions: 5
+  min_safety_score: 40
+  min_liquidity_usd: 500
+  use_jito: true
+  jito_tip_sol: 0.001
+  tracked_wallets:
+    - address: "WHALE_WALLET_ADDRESS"
+      tier: "whale"
+      label: "Known whale"
+```
+
+## Quick Start
 
 ### Prerequisites
 
-- Python 3.11+
-- Redis 7.0+
-- PostgreSQL 15+
-- API keys for: Helius, Alchemy, Birdeye, GoPlus
+- Go 1.24+
+- Solana RPC endpoint (Helius recommended)
+- Solana wallet with SOL
 
-### Installation
-
-```bash
-# Clone repository
-git clone https://github.com/yourusername/multichain-memecoin-hunter.git
-cd multichain-memecoin-hunter
-
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy and configure
-cp config/config.example.yaml config/config.yaml
-# Edit config.yaml with your API keys
-
-# Setup database
-./scripts/setup_postgres.sh
-
-# Setup Redis
-./scripts/setup_redis.sh
-
-# Run
-python src/main.py
-```
-
-### Docker Compose
+### Build
 
 ```bash
-docker-compose up -d
+cd nexus
+go build -o bin/ ./cmd/...
 ```
 
-## 📖 Documentation
+### Run (dry-run mode)
 
-- [Architecture & Solana Adapter](docs/01-architecture-solana.md)
-- [Base Adapter Specification](docs/02-base-adapter.md)
-- [Scoring, Execution & Infrastructure](docs/03-scoring-execution.md)
-- [API Reference](docs/API_REFERENCE.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [Troubleshooting](docs/TROUBLESHOOTING.md)
+```bash
+./bin/nexus-hunter --config config.yaml
+```
 
-## ⚠️ Important Notes
+### Run Tests
+
+```bash
+cd nexus
+go test -race -count=1 ./...
+```
+
+**Current test status**: 497 tests passing, ~34,000 LOC
+
+## Important Notes
 
 ### Safety First
-- This system is designed with **SAFETY > PROFIT** philosophy
-- All trades are subject to portfolio limits and risk checks
-- Two-level security validation prevents most honeypots
-- Circuit breaker protects against cascading failures
+- All trades subject to daily spend/loss limits
+- Two-level security: pre-filter (L0 sanitizer) + pre-buy (analyzer + sell sim)
+- CSM monitors every open position continuously
+- Kill switch stops everything immediately (in-process, no Kafka dependency)
 
-### Backtesting Required
-- Always backtest scoring weights on historical data
-- Empirically validate assumptions before live trading
-- Monitor P&L and adjust parameters continuously
-
-### MEV & Slippage
-- Solana: Jito Bundles protect against sandwich attacks
-- Base: Minimal MEV, but still present
-- BSC: High slippage expected, MEV protection recommended
-- Always simulate slippage before execution
+### Dry-Run Required
+- Always start in dry-run mode (`dry_run: true`)
+- Monitor scoring accuracy and signal quality before live trading
+- Paper Marathon (S7) recommended before going live
 
 ### Not Financial Advice
 - This is a trading bot, not investment advice
@@ -507,23 +239,18 @@ docker-compose up -d
 - You can lose your entire investment
 - Use at your own risk
 
-## 📝 License
+## Documentation
+
+- [Architecture & Pipeline](docs/01-architecture-solana.md)
+- [Scoring & Execution](docs/03-scoring-execution.md)
+- [External API Reference](docs/API_REFERENCE.md)
+- [Development Roadmap](ROADMAP.md)
+- [NEXUS Platform Plan](NEXUS_PLAN.md)
+
+## License
 
 MIT License - See LICENSE file for details
 
-## 🤝 Contributing
-
-Contributions are welcome! Please see CONTRIBUTING.md for guidelines.
-
-## 📧 Support
-
-For issues, questions, or suggestions:
-- Open an issue on GitHub
-- Check TROUBLESHOOTING.md
-- Review documentation
-
 ---
 
-**Built with ❤️ for memecoin traders who value safety and reliability.**
-
-*Last Updated: 2026-02-09*
+*Last Updated: 2026-02-23*

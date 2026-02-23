@@ -1,15 +1,169 @@
 # API Reference
 
-Complete API endpoints and authentication details for all services used by Multi-Chain Memecoin Hunter v2.0.
+API endpoints for all services used by NEXUS Memecoin Hunter v3.2.
 
 ## Table of Contents
 
-1. [Solana APIs](#solana-apis)
-2. [Base APIs](#base-apis)
-3. [Security APIs](#security-apis)
-4. [Price & Market Data](#price--market-data)
-5. [DEX APIs](#dex-apis)
+1. [Hunter HTTP API](#hunter-http-api)
+2. [Solana APIs](#solana-apis)
+3. [DEX APIs](#dex-apis)
+4. [Security APIs](#security-apis)
+5. [Price & Market Data](#price--market-data)
 6. [Rate Limits](#rate-limits)
+
+---
+
+## Hunter HTTP API
+
+The nexus-hunter binary exposes an HTTP API on port 9092 (PrometheusPort + 2).
+
+### Health
+
+**GET /health**
+
+```json
+{
+    "status": "ok",
+    "dry_run": true,
+    "paused": false,
+    "killed": false
+}
+```
+
+### Stats
+
+**GET /stats**
+
+Returns combined statistics from all modules:
+
+```json
+{
+    "sniper": {
+        "total_snipes": 42,
+        "total_sells": 38,
+        "win_count": 25,
+        "loss_count": 13,
+        "open_positions": 3,
+        "daily_spent_sol": "1.5",
+        "daily_loss_sol": "0.3"
+    },
+    "scanner": {
+        "pools_discovered": 1250,
+        "l0_passed": 340,
+        "l0_dropped": 910,
+        "analyzed": 340
+    },
+    "graph": {
+        "node_count": 15000,
+        "edge_count": 28000,
+        "query_count": 340
+    },
+    "liquidity": { "tracked_tokens": 50 },
+    "narrative": { "active_narratives": 7 },
+    "honeypot": { "known_signatures": 12 },
+    "correlation": { "active_clusters": 8 },
+    "copytrade": { "tracked_wallets": 5, "active_signals": 3 },
+    "adaptive_weights": {
+        "outcomes_recorded": 38,
+        "last_recalc": "2026-02-23T10:30:00Z",
+        "current_weights": {
+            "safety": 0.32, "entity": 0.14,
+            "social": 0.19, "onchain": 0.21, "timing": 0.14
+        }
+    }
+}
+```
+
+### Positions
+
+**GET /positions**
+
+Returns all positions (open and closed).
+
+**GET /positions/open**
+
+Returns only currently open positions:
+
+```json
+[
+    {
+        "id": "uuid-1234",
+        "token_mint": "ABcd...pump",
+        "pool_address": "Pool...",
+        "dex": "raydium",
+        "entry_price_usd": 0.0001234,
+        "amount_token": 1000000,
+        "cost_sol": 0.1,
+        "current_price": 0.0002468,
+        "highest_price": 0.0003000,
+        "pnl_pct": 100.0,
+        "safety_score": 72,
+        "status": "OPEN",
+        "opened_at": "2026-02-23T09:15:00Z"
+    }
+]
+```
+
+### Control Plane
+
+**POST /control/pause**
+
+Soft pause: stops opening new positions, continues managing existing ones.
+
+**POST /control/resume**
+
+Resume from paused state.
+
+**POST /control/kill**
+
+Hard kill: force closes all open positions, halts system.
+
+**GET /control/status**
+
+```json
+{
+    "paused": false,
+    "killed": false,
+    "dry_run": true,
+    "instance_id": "nexus-1",
+    "open_positions": 3
+}
+```
+
+### Copy-Trade Wallet Management
+
+**GET /copytrade/wallets**
+
+```json
+[
+    {
+        "address": "7Xyz...",
+        "tier": "whale",
+        "label": "Known whale",
+        "win_rate": 0.65,
+        "avg_roi": 120.5,
+        "trade_count": 48
+    }
+]
+```
+
+**POST /copytrade/wallets**
+
+```json
+{
+    "address": "8Abc...",
+    "tier": "smart_money",
+    "label": "Smart money wallet"
+}
+```
+
+**DELETE /copytrade/wallets**
+
+```json
+{
+    "address": "8Abc..."
+}
+```
 
 ---
 
@@ -20,104 +174,18 @@ Complete API endpoints and authentication details for all services used by Multi
 **Endpoints:**
 - RPC: `https://mainnet.helius-rpc.com/?api-key={KEY}`
 - WebSocket: `wss://mainnet.helius-rpc.com/?api-key={KEY}`
-- Webhooks: `https://api.helius.xyz/v0/webhooks?api-key={KEY}`
 
 **Authentication:** URL parameter `api-key`
 
-**Plans:**
-- Free: Limited
-- Business: $199/mo (recommended for production)
-
-**Methods:**
+**Methods used by nexus-hunter:**
 - `getAccountInfo` — Get mint/freeze authority
-- `getAsset` — Token metadata (DAS)
 - `getTokenLargestAccounts` — Top token holders
-- `logsSubscribe` — Subscribe to program logs
-- `accountSubscribe` — Monitor wallet changes
-- `signatureSubscribe` — Track TX confirmation
+- `logsSubscribe` — Subscribe to program logs (pool detection)
 - `sendTransaction` — Send signed TX
 
-**Rate Limits:** Plan-dependent (typically 10 calls/sec for Business)
+**Rate Limits:** Plan-dependent (10 calls/sec for Business plan)
 
----
-
-### PumpPortal WebSocket
-
-**Endpoint:** `wss://pumpportal.fun/api/data`
-
-**Authentication:** None (free tier)
-
-**Subscriptions:**
-
-```json
-// New token creation
-{"method": "subscribeNewToken"}
-
-// Migration (graduation)
-{"method": "subscribeMigration"}
-
-// Token trades
-{"method": "subscribeTokenTrade", "keys": ["<MINT_CA>"]}
-
-// Whale wallet tracking
-{"method": "subscribeAccountTrade", "keys": ["<WALLET>"]}
-
-// Unsubscribe
-{"method": "unsubscribeNewToken"}
-{"method": "unsubscribeTokenTrade", "keys": ["<MINT_CA>"]}
-```
-
-**Response Format:**
-
-```json
-{
-    "signature": "5K7x...",
-    "mint": "ABcd...pump",
-    "traderPublicKey": "7Xyz...",
-    "txType": "create|buy|sell|migrate",
-    "initialBuy": 69000000,
-    "bondingCurveKey": "BCur...",
-    "vTokensInBondingCurve": 1000000000,
-    "vSolInBondingCurve": 30000000,
-    "marketCapSol": 30.5,
-    "name": "DogCoin",
-    "symbol": "DOG",
-    "uri": "https://..."
-}
-```
-
-**Rate Limits:** Rate-limited (no exact limit published)
-
-**Cost:** FREE
-
----
-
-### PumpPortal Trade API
-
-**Endpoint:** `https://pumpportal.fun/api/trade-local`
-
-**Method:** POST
-
-**Request:**
-
-```json
-{
-    "publicKey": "<WALLET>",
-    "action": "buy|sell",
-    "mint": "<TOKEN_CA>",
-    "denominatedInSol": "true",
-    "amount": 0.1,
-    "slippage": 15,
-    "priorityFee": 0.00001,
-    "pool": "pump"
-}
-```
-
-**Response:** Raw TX bytes (sign locally, send via RPC)
-
-**Fee:** 0.5% per trade
-
-**Cost:** FREE (fee-based)
+**Cost:** $199/mo (Business plan recommended)
 
 ---
 
@@ -140,360 +208,22 @@ Complete API endpoints and authentication details for all services used by Multi
 
 **Benefit:** Private mempool, no sandwich attacks
 
-**Cost:** FREE (tip-based)
-
----
-
-## Base APIs
-
-### Alchemy RPC (Base)
-
-**Endpoints:**
-- RPC: `https://base-mainnet.g.alchemy.com/v2/{KEY}`
-- WebSocket: `wss://base-mainnet.g.alchemy.com/v2/{KEY}`
-
-**Authentication:** URL parameter `v2/{KEY}`
-
-**Plans:**
-- Free: Limited
-- Growth: $49/mo (recommended)
-
-**Methods:**
-- `eth_subscribe` — Subscribe to logs
-- `eth_blockNumber` — Get latest block
-- `eth_call` — Read contract state
-- `eth_sendRawTransaction` — Send signed TX
-- `eth_getTransactionReceipt` — Get TX receipt
-
-**Rate Limits:** Plan-dependent (typically 5 calls/sec for Growth)
-
----
-
-### 0x API (Base)
-
-**Endpoints:**
-- Price: `https://base.api.0x.org/swap/v1/price`
-- Quote: `https://base.api.0x.org/swap/v1/quote`
-- Swap: `https://base.api.0x.org/swap/v1/swap`
-
-**Authentication:** Header `0x-api-key` (optional for free tier)
-
-**Price Request:**
-
-```
-GET /swap/v1/price?sellToken=0x...&buyToken=0x...&sellAmount=1000000
-```
-
-**Response:**
-
-```json
-{
-    "chainId": 8453,
-    "price": "1.234",
-    "estimatedPriceImpact": "0.01",
-    "value": "0",
-    "gasPrice": "1000000000",
-    "gas": "150000",
-    "estimatedGas": "150000",
-    "protocolFees": [],
-    "buyAmount": "1234000",
-    "sellTokenAddress": "0x...",
-    "buyTokenAddress": "0x...",
-    "sources": [...]
-}
-```
-
-**Rate Limits:** 100k calls/month (free tier)
-
-**Cost:** FREE
-
----
-
-## Security APIs
-
-### Birdeye Security
-
-**Endpoint:** `https://public-api.birdeye.so/defi/token_security`
-
-**Authentication:** Header `X-API-KEY`
-
-**Request:**
-
-```
-GET /defi/token_security?address={MINT}
-Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
-```
-
-**Response:**
-
-```json
-{
-    "data": {
-        "isMintable": false,
-        "isFreezable": false,
-        "top10HolderPercent": 45.2,
-        "lpBurnedPercent": 95.0,
-        "holderCount": 1234,
-        "lpHolderCount": 56
-    }
-}
-```
-
-**Plans:**
-- Free: Limited
-- Standard: $99/mo (recommended)
-
-**Rate Limits:** Plan-dependent
-
----
-
-### Birdeye Token Overview
-
-**Endpoint:** `https://public-api.birdeye.so/defi/token_overview`
-
-**Request:**
-
-```
-GET /defi/token_overview?address={MINT}
-Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
-```
-
-**Response:**
-
-```json
-{
-    "data": {
-        "address": "...",
-        "symbol": "DOG",
-        "name": "DogCoin",
-        "decimals": 6,
-        "price": 0.0001234,
-        "priceChange": {
-            "h1": 5.2,
-            "h24": 12.3,
-            "h7d": 45.6
-        },
-        "volume": {
-            "h1": 50000,
-            "h24": 500000,
-            "h7d": 5000000
-        },
-        "liquidity": 100000,
-        "holderCount": 1234,
-        "buys": 567,
-        "sells": 234
-    }
-}
-```
-
-**Rate Limits:** Plan-dependent
-
----
-
-### GoPlus Security (Base/BSC)
-
-**Endpoint:** `https://api.gopluslabs.io/api/v1/token_security/{CHAIN_ID}`
-
-**Parameters:**
-- `contract_addresses` — Token address (comma-separated)
-
-**Chain IDs:**
-- Base: `8453`
-- BSC: `56`
-
-**Request:**
-
-```
-GET /api/v1/token_security/8453?contract_addresses=0x...
-```
-
-**Response:**
-
-```json
-{
-    "code": "1",
-    "message": "OK",
-    "result": {
-        "0x...": {
-            "is_honeypot": "0",
-            "is_mintable": "0",
-            "owner_change_balance": "0",
-            "hidden_owner": "0",
-            "selfdestruct": "0",
-            "transfer_pausable": "0",
-            "is_proxy": "0",
-            "buy_tax": "0.01",
-            "sell_tax": "0.01",
-            "holder_count": "1234",
-            "lp_holder_count": "56",
-            "holders": [...]
-        }
-    }
-}
-```
-
-**Rate Limits:** 30 calls/minute
-
-**Cost:** FREE
-
----
-
-### Basescan API
-
-**Endpoint:** `https://api.basescan.org/api`
-
-**Authentication:** Query parameter `apikey`
-
-**Get Contract Source Code:**
-
-```
-GET /api?module=contract&action=getsourcecode&address=0x...&apikey={KEY}
-```
-
-**Response:**
-
-```json
-{
-    "status": "1",
-    "message": "OK",
-    "result": [
-        {
-            "SourceCode": "...",
-            "ABI": "...",
-            "ContractName": "Token",
-            "CompilerVersion": "v0.8.0",
-            "Verified": "1"
-        }
-    ]
-}
-```
-
-**Rate Limits:** 5 calls/second
-
-**Cost:** FREE
-
----
-
-## Price & Market Data
-
-### Jupiter Price API
-
-**Endpoint:** `https://price.jup.ag/v6/price`
-
-**Request:**
-
-```
-GET /v6/price?ids={MINT1},{MINT2}&vsToken=So11111111111111111111111111111111111111112
-```
-
-**Response:**
-
-```json
-{
-    "data": {
-        "So11111111111111111111111111111111111111112": {
-            "id": "So11111111111111111111111111111111111111112",
-            "mintSymbol": "SOL",
-            "vsToken": "So11111111111111111111111111111111111111112",
-            "vsTokenSymbol": "SOL",
-            "price": "1.0"
-        },
-        "EPjFWaLb3odccjf2cj6ipjsPSEtQDDUSqualEhUWQjv": {
-            "id": "EPjFWaLb3odccjf2cj6ipjsPSEtQDDUSqualEhUWQjv",
-            "mintSymbol": "USDC",
-            "vsToken": "So11111111111111111111111111111111111111112",
-            "vsTokenSymbol": "SOL",
-            "price": "0.0001234"
-        }
-    }
-}
-```
-
-**Rate Limits:** Unlimited
-
-**Cost:** FREE
-
----
-
-### DexScreener API
-
-**Endpoint:** `https://api.dexscreener.com/latest/dex/tokens/{TOKEN_ADDRESS}`
-
-**Request:**
-
-```
-GET /latest/dex/tokens/{TOKEN_ADDRESS}
-```
-
-**Response:**
-
-```json
-{
-    "schemaVersion": "1.0.0",
-    "pairs": [
-        {
-            "chainId": "solana",
-            "dexId": "raydium",
-            "url": "https://dexscreener.com/solana/...",
-            "pairAddress": "...",
-            "baseToken": {
-                "address": "...",
-                "name": "DogCoin",
-                "symbol": "DOG"
-            },
-            "quoteToken": {
-                "address": "So11111111111111111111111111111111111111112",
-                "name": "Wrapped SOL",
-                "symbol": "SOL"
-            },
-            "priceUsd": "0.0001234",
-            "priceNative": "0.00123",
-            "priceChange": {
-                "m5": 5.2,
-                "h1": 12.3,
-                "h24": 45.6
-            },
-            "volume": {
-                "m5": 50000,
-                "h1": 500000,
-                "h24": 5000000
-            },
-            "liquidity": {
-                "usd": 100000,
-                "base": 1000000000,
-                "quote": 123000
-            },
-            "txns": {
-                "m5": {"buys": 10, "sells": 5},
-                "h1": {"buys": 100, "sells": 50},
-                "h24": {"buys": 1000, "sells": 500}
-            }
-        }
-    ]
-}
-```
-
-**Rate Limits:** Unlimited
-
-**Cost:** FREE
+**Cost:** FREE (tip included in TX)
 
 ---
 
 ## DEX APIs
 
-### Jupiter Swap API
+### Jupiter V6
 
-**Quote Endpoint:** `https://quote-api.jup.ag/v6/quote`
-
-**Request:**
+**Quote:** `GET https://quote-api.jup.ag/v6/quote`
 
 ```
-GET /v6/quote
-  ?inputMint=So11111111111111111111111111111111111111112
-  &outputMint={TOKEN}
-  &amount={LAMPORTS}
-  &slippageBps=300
-  &dynamicSlippage=true
+?inputMint=So11111111111111111111111111111111111111112
+&outputMint={TOKEN}
+&amount={LAMPORTS}
+&slippageBps=300
+&dynamicSlippage=true
 ```
 
 **Response:**
@@ -507,14 +237,11 @@ GET /v6/quote
     "otherAmountThreshold": "1200000",
     "swapMode": "ExactIn",
     "priceImpactPct": "0.5",
-    "marketInfos": [...],
     "routePlan": [...]
 }
 ```
 
-**Swap Endpoint:** `https://quote-api.jup.ag/v6/swap`
-
-**Request:**
+**Swap:** `POST https://quote-api.jup.ag/v6/swap`
 
 ```json
 {
@@ -541,81 +268,133 @@ GET /v6/quote
 }
 ```
 
-**Rate Limits:** Unlimited
+**Price:** `GET https://price.jup.ag/v6/price?ids={MINT1},{MINT2}&vsToken=So111...2`
 
-**Cost:** FREE
-
----
-
-### Uniswap V3 (Base)
-
-**Router Address:** `0xE592427A0AEce92De3Edee1F18E0157C05861564`
-
-**Methods:**
-- `exactInputSingle` — Swap exact input amount
-- `exactOutputSingle` — Swap for exact output amount
-
-**Fee Tiers:**
-- 0.01% (100 bps)
-- 0.05% (500 bps)
-- 0.30% (3000 bps)
-- 1.00% (10000 bps) — Most common for memecoins
-
-**Cost:** Gas fees only
+**Rate Limits:** Unlimited | **Cost:** FREE
 
 ---
 
-### Aerodrome (Base)
+## Security APIs
 
-**Router Address:** `0xcF77a3Ba9A5CA922335EaC26B0A7DB85d5E7e907`
+### Birdeye Security (Solana)
 
-**Methods:**
-- `swapExactTokensForTokens` — Swap exact input
-- `swapTokensForExactTokens` — Swap for exact output
+**Endpoint:** `https://public-api.birdeye.so/defi/token_security`
 
-**Pool Types:**
-- Stable pools (for stablecoins)
-- Volatile pools (for memecoins)
+**Request:**
 
-**Cost:** Gas fees only
+```
+GET /defi/token_security?address={MINT}
+Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
+```
+
+**Response:**
+
+```json
+{
+    "data": {
+        "isMintable": false,
+        "isFreezable": false,
+        "top10HolderPercent": 45.2,
+        "lpBurnedPercent": 95.0,
+        "holderCount": 1234,
+        "lpHolderCount": 56
+    }
+}
+```
+
+**Rate Limits:** Plan-dependent (~60/min for Standard)
+
+**Cost:** $99/mo (Standard plan)
+
+---
+
+### Birdeye Token Overview
+
+**Endpoint:** `https://public-api.birdeye.so/defi/token_overview`
+
+**Request:**
+
+```
+GET /defi/token_overview?address={MINT}
+Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
+```
+
+**Response:**
+
+```json
+{
+    "data": {
+        "address": "...",
+        "symbol": "DOG",
+        "name": "DogCoin",
+        "decimals": 6,
+        "price": 0.0001234,
+        "priceChange": { "h1": 5.2, "h24": 12.3 },
+        "volume": { "h1": 50000, "h24": 500000 },
+        "liquidity": 100000,
+        "holderCount": 1234,
+        "buys": 567,
+        "sells": 234
+    }
+}
+```
+
+---
+
+### DexScreener
+
+**Endpoint:** `https://api.dexscreener.com/latest/dex/tokens/{TOKEN_ADDRESS}`
+
+**Response:**
+
+```json
+{
+    "pairs": [
+        {
+            "chainId": "solana",
+            "dexId": "raydium",
+            "pairAddress": "...",
+            "baseToken": { "address": "...", "name": "DogCoin", "symbol": "DOG" },
+            "quoteToken": { "address": "So11...2", "symbol": "SOL" },
+            "priceUsd": "0.0001234",
+            "volume": { "h1": 500000, "h24": 5000000 },
+            "liquidity": { "usd": 100000 },
+            "txns": {
+                "h1": { "buys": 100, "sells": 50 },
+                "h24": { "buys": 1000, "sells": 500 }
+            }
+        }
+    ]
+}
+```
+
+**Rate Limits:** Unlimited | **Cost:** FREE
 
 ---
 
 ## Rate Limits
 
-### Summary Table
+### Summary
 
-| Service | Limit | Notes |
-|---------|-------|-------|
-| Helius RPC | Plan-dependent | 10/sec for Business |
-| PumpPortal WS | Rate-limited | No exact limit |
-| Birdeye | Plan-dependent | 60/min for Standard |
-| GoPlus | 30/min | Free tier |
-| Basescan | 5/sec | Free tier |
-| Jupiter | Unlimited | Free tier |
-| DexScreener | Unlimited | Free tier |
-| Alchemy (Base) | Plan-dependent | 5/sec for Growth |
-| 0x | 100k/month | Free tier |
+| Service | Limit | Auth |
+|---------|-------|------|
+| Helius RPC | Plan-dependent (10/sec Business) | URL param |
+| Jupiter V6 | Unlimited | None |
+| Birdeye | Plan-dependent (~60/min Standard) | Header: X-API-KEY |
+| DexScreener | Unlimited | None |
+| Jito | Unlimited | None |
 
-### Rate Limiting Strategy
+### Cost Summary (Solana MVP)
 
-**Token Bucket Implementation:**
-
-```python
-RATE_LIMITS = {
-    "birdeye":     1.0,   # calls/sec (~60/min)
-    "goplus":      0.5,   # 30/min
-    "basescan":    5.0,   # 5/sec
-    "helius":      10.0,  # plan-based
-    "dexscreener": 5.0,   # generous
-}
-```
-
-**Exponential Backoff:**
-- Attempt 1: immediate
-- Attempt 2: wait 1s
-- Attempt 3: wait 2s
-- Attempt 4: wait 4s (max 30s)
+| Provider | Plan | $/mo |
+|----------|------|------|
+| Helius | Business | $199 |
+| Birdeye | Standard | $99 |
+| Jupiter | Free | $0 |
+| DexScreener | Free | $0 |
+| Jito | Free (tip in TX) | $0 |
+| VPS (Hetzner) | 64GB RAM | $45 |
+| **TOTAL** | | **~$343/mo** |
 
 ---
 
@@ -623,24 +402,22 @@ RATE_LIMITS = {
 
 ### API Key Management
 
-Store all API keys in environment variables:
+Store all API keys in environment variables or YAML config:
 
-```bash
-export HELIUS_API_KEY="your_key_here"
-export ALCHEMY_API_KEY="your_key_here"
-export BIRDEYE_API_KEY="your_key_here"
-export BASESCAN_API_KEY="your_key_here"
-export ZERO_X_API_KEY="your_key_here"
+```yaml
+solana:
+  rpc_endpoint: "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+  ws_endpoint: "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+  private_key: "YOUR_WALLET_PRIVATE_KEY_BASE58"
 ```
 
 ### Security Best Practices
 
-1. **Never commit API keys** to version control
-2. **Use .env files** with .gitignore
-3. **Rotate keys regularly** (monthly recommended)
-4. **Use read-only keys** where possible
-5. **Monitor usage** for unusual activity
-6. **Set IP whitelists** if available
+1. Never commit API keys to version control
+2. Use .gitignore for config files with keys
+3. Rotate keys regularly
+4. Use read-only keys where possible
+5. Monitor usage for unusual activity
 
 ---
 
@@ -652,28 +429,18 @@ export ZERO_X_API_KEY="your_key_here"
 |------|---------|--------|
 | 200 | OK | Process response |
 | 400 | Bad Request | Check parameters |
-| 401 | Unauthorized | Check API key |
-| 403 | Forbidden | Check permissions |
 | 429 | Rate Limited | Backoff and retry |
 | 500 | Server Error | Retry with backoff |
-| 503 | Service Unavailable | Fallback to backup |
+| 503 | Service Unavailable | Fallback |
 
-### Retry Strategy
+### Retry Strategy (Go implementation)
 
-```python
-async def call_with_retry(api_call, max_attempts=4):
-    for attempt in range(max_attempts):
-        try:
-            return await api_call()
-        except RateLimitError:
-            wait_time = min(2 ** attempt, 30)
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            if attempt == max_attempts - 1:
-                raise
-            await asyncio.sleep(2 ** attempt)
-```
+Exponential backoff with max retries:
+- Attempt 1: immediate
+- Attempt 2: wait 1s
+- Attempt 3: wait 2s
+- Attempt 4: wait 4s (max 30s)
 
 ---
 
-*Last Updated: 2026-02-09*
+*Last Updated: 2026-02-23*
