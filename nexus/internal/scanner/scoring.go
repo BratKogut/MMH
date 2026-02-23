@@ -1,8 +1,10 @@
 package scanner
 
 import (
+	"sync"
 	"time"
 
+	"github.com/nexus-trading/nexus/internal/copytrade"
 	"github.com/nexus-trading/nexus/internal/correlation"
 	"github.com/nexus-trading/nexus/internal/graph"
 	"github.com/nexus-trading/nexus/internal/honeypot"
@@ -81,6 +83,7 @@ type ScoringInput struct {
 	NarrativeState   *narrative.NarrativeState       // from Engine.GetTokenNarrative()
 	CrossTokenState  *correlation.CrossTokenState    // from Detector.GetClusterState()
 	HoneypotMatch    *honeypot.Signature             // from Tracker.CheckContract()
+	CopyTradeSignal  *copytrade.CopySignal           // from Tracker.GetSignal()
 }
 
 // WhaleSignal represents a whale wallet event.
@@ -103,11 +106,26 @@ type SocialData struct {
 // Scorer computes 5-dimensional token scores.
 type Scorer struct {
 	config ScoringConfig
+	mu     sync.RWMutex
 }
 
 // NewScorer creates a new 5D scorer.
 func NewScorer(config ScoringConfig) *Scorer {
 	return &Scorer{config: config}
+}
+
+// SetWeights dynamically updates the scoring weights (used by adaptive weight engine).
+func (s *Scorer) SetWeights(w ScoringWeights) {
+	s.mu.Lock()
+	s.config.Weights = w
+	s.mu.Unlock()
+}
+
+// GetWeights returns the current scoring weights.
+func (s *Scorer) GetWeights() ScoringWeights {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.Weights
 }
 
 // Score computes the full 5D score for a token.
@@ -165,8 +183,10 @@ func (s *Scorer) Score(input ScoringInput) TokenScore {
 	// Correlation bonus.
 	ts.CorrelationBonus, ts.CorrelationType = s.correlationBonus(input, ts)
 
-	// Weighted total.
+	// Weighted total (read under lock for adaptive weight safety).
+	s.mu.RLock()
 	w := s.config.Weights
+	s.mu.RUnlock()
 	ts.Total = (ts.Safety * w.Safety) +
 		(ts.Entity * w.Entity) +
 		(ts.Social * w.Social) +
@@ -249,6 +269,15 @@ func (s *Scorer) v32ScoreAdjust(input ScoringInput) v32Adjustment {
 	if input.HoneypotMatch != nil && input.HoneypotMatch.Confidence >= 0.3 && input.HoneypotMatch.Confidence < 0.7 {
 		adj.safetyAdj -= 20
 		adj.reasons = append(adj.reasons, "v32_honeypot_partial:"+input.HoneypotMatch.PatternID)
+	}
+
+	// Copy-trade signal impacts on-chain dimension.
+	if input.CopyTradeSignal != nil {
+		impact := copytrade.ScoreImpact(input.CopyTradeSignal)
+		if impact != 0 {
+			adj.onChainAdj += impact
+			adj.reasons = append(adj.reasons, "v32_copytrade:"+string(input.CopyTradeSignal.Signal))
+		}
 	}
 
 	return adj
