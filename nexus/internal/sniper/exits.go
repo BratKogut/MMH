@@ -2,6 +2,7 @@ package sniper
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -302,7 +303,7 @@ func (ee *ExitEngine) remainingTokens(tracker *ExitTracker) decimal.Decimal {
 }
 
 func tpLevelReason(level int) string {
-	return "TAKE_PROFIT_L" + string(rune('1'+level))
+	return "TAKE_PROFIT_L" + strconv.Itoa(level+1)
 }
 
 func timedExitReason(minutes int) string {

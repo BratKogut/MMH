@@ -91,8 +91,10 @@ func (s *SellSimulator) SimulatePreBuy(ctx context.Context, buyAmountSOL decimal
 
 	// Estimate tokens received from buying (constant product: x * y = k).
 	// buyAmountSOL goes into QuoteReserve, we get tokens out of TokenReserve.
-	numerator := buyAmountSOL.Mul(pool.TokenReserve)
-	denominator := pool.QuoteReserve.Add(buyAmountSOL)
+	// Apply pool fee to buy amount.
+	effectiveBuy := buyAmountSOL.Mul(poolFeeMultiplier)
+	numerator := effectiveBuy.Mul(pool.TokenReserve)
+	denominator := pool.QuoteReserve.Add(effectiveBuy)
 	if denominator.IsZero() {
 		return SellSimResult{
 			CanSell:      false,
@@ -111,13 +113,18 @@ func (s *SellSimulator) SimulatePreBuy(ctx context.Context, buyAmountSOL decimal
 	return s.SimulateSell(ctx, pool.TokenMint, estimatedTokens, pool)
 }
 
-// calculateExpectedOutput uses constant product AMM formula.
+// poolFeeRate is the standard AMM trading fee (0.25% for Raydium/Orca).
+var poolFeeMultiplier = decimal.NewFromFloat(0.9975)
+
+// calculateExpectedOutput uses constant product AMM formula with pool fee.
 func (s *SellSimulator) calculateExpectedOutput(tokenAmount decimal.Decimal, pool solana.PoolInfo) decimal.Decimal {
 	if pool.TokenReserve.IsZero() || pool.QuoteReserve.IsZero() {
 		return decimal.Zero
 	}
-	numerator := tokenAmount.Mul(pool.QuoteReserve)
-	denominator := pool.TokenReserve.Add(tokenAmount)
+	// Apply pool fee to input amount before constant product calculation.
+	effectiveAmount := tokenAmount.Mul(poolFeeMultiplier)
+	numerator := effectiveAmount.Mul(pool.QuoteReserve)
+	denominator := pool.TokenReserve.Add(effectiveAmount)
 	if denominator.IsZero() {
 		return decimal.Zero
 	}

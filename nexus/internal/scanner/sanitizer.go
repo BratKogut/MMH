@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -127,18 +128,25 @@ func (s *Sanitizer) Check(discovery PoolDiscovery) SanitizerResult {
 		return r
 	}
 
-	// F5: Entity graph check (~2ms).
+	// F5: Entity graph check (~2ms). Returns deployer address for F6.
+	var deployerAddr string
 	if s.graph != nil && pool.TokenMint != "" {
-		if r := s.checkEntityGraph(pool); !r.Passed {
+		var r SanitizerResult
+		r, deployerAddr = s.checkEntityGraph(pool)
+		if !r.Passed {
 			r.LatencyUs = time.Since(start).Microseconds()
 			s.recordDrop("entity_graph")
 			return r
 		}
 	}
 
-	// F6: Deployer history (~0.1ms).
+	// F6: Deployer history (~0.1ms). Uses real deployer from entity graph.
 	if pool.TokenMint != "" {
-		if r := s.checkDeployerHistory(pool); !r.Passed {
+		addr := deployerAddr
+		if addr == "" {
+			addr = string(pool.TokenMint) // fallback if no graph
+		}
+		if r := s.checkDeployerHistory(addr); !r.Passed {
 			r.LatencyUs = time.Since(start).Microseconds()
 			s.recordDrop("deployer_hist")
 			return r
@@ -215,12 +223,13 @@ func (s *Sanitizer) checkNamePatterns(token *solana.TokenInfo) SanitizerResult {
 		}
 	}
 
-	// Check for unicode tricks (mixed scripts).
+	// Check for unicode tricks (Cyrillic lookalikes, confusable scripts).
 	for _, r := range name {
-		if r > 0x024F && r < 0x0370 { // Cyrillic lookalikes
+		if (r >= 0x0400 && r <= 0x04FF) || // Cyrillic
+			(r >= 0x0500 && r <= 0x052F) { // Cyrillic Supplement
 			return SanitizerResult{
 				Passed: false,
-				Reason: "suspicious unicode characters in name",
+				Reason: "suspicious unicode characters in name (Cyrillic)",
 				Filter: "name_pattern",
 			}
 		}
@@ -264,8 +273,9 @@ func (s *Sanitizer) checkLiquidity(pool solana.PoolInfo) SanitizerResult {
 	return SanitizerResult{Passed: true}
 }
 
-func (s *Sanitizer) checkEntityGraph(pool solana.PoolInfo) SanitizerResult {
+func (s *Sanitizer) checkEntityGraph(pool solana.PoolInfo) (SanitizerResult, string) {
 	report := s.graph.QueryDeployer(string(pool.TokenMint))
+	deployer := report.SeedFunder // actual deployer address from graph
 
 	// 1-hop to serial rugger = instant kill.
 	if report.HopsToRugger == 1 {
@@ -273,16 +283,16 @@ func (s *Sanitizer) checkEntityGraph(pool solana.PoolInfo) SanitizerResult {
 			Passed: false,
 			Reason: "deployer 1-hop from SERIAL_RUGGER",
 			Filter: "entity_graph",
-		}
+		}, deployer
 	}
 
 	// Sybil cluster too large.
 	if report.ClusterSize > s.config.SybilClusterThreshold {
 		return SanitizerResult{
 			Passed: false,
-			Reason: "deployer in large Sybil cluster: " + string(rune('0'+report.ClusterSize)),
+			Reason: fmt.Sprintf("deployer in large Sybil cluster: %d", report.ClusterSize),
 			Filter: "entity_graph",
-		}
+		}, deployer
 	}
 
 	// Wash trader label.
@@ -292,15 +302,14 @@ func (s *Sanitizer) checkEntityGraph(pool solana.PoolInfo) SanitizerResult {
 				Passed: false,
 				Reason: "deployer labeled WASH_TRADER",
 				Filter: "entity_graph",
-			}
+			}, deployer
 		}
 	}
 
-	return SanitizerResult{Passed: true}
+	return SanitizerResult{Passed: true}, deployer
 }
 
-func (s *Sanitizer) checkDeployerHistory(pool solana.PoolInfo) SanitizerResult {
-	deployer := string(pool.TokenMint) // simplified: use token mint as deployer proxy
+func (s *Sanitizer) checkDeployerHistory(deployer string) SanitizerResult {
 	now := time.Now()
 
 	s.deployerMu.Lock()

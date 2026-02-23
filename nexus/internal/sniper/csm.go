@@ -71,9 +71,11 @@ type CSM struct {
 	sellSim   *scanner.SellSimulator
 	rpc       solana.RPCClient
 	onPanic   func(ctx context.Context, pos *Position, reason string)
+	onWarning func(ctx context.Context, pos *Position, reason string, severity float64) // graduated response
 
 	entryLiquidityUSD decimal.Decimal
 	lastSellSim       scanner.SellSimResult
+	warningFired      map[string]bool // prevent duplicate warnings per reason
 
 	// CSM-2: Holder Exodus.
 	entryHolders *holderSnapshot
@@ -95,7 +97,14 @@ func NewCSM(config CSMConfig, pos *Position, sellSim *scanner.SellSimulator, rpc
 		rpc:               rpc,
 		onPanic:           onPanic,
 		entryLiquidityUSD: entryLiq,
+		warningFired:      make(map[string]bool),
 	}
+}
+
+// SetOnWarning sets the graduated response callback for partial exits.
+// severity: 0.0-1.0 (how close to panic threshold).
+func (c *CSM) SetOnWarning(fn func(ctx context.Context, pos *Position, reason string, severity float64)) {
+	c.onWarning = fn
 }
 
 // SetEntityGraph wires in the entity graph engine for CSM-4 re-checks.
@@ -235,6 +244,17 @@ func (c *CSM) checkLiquidity(ctx context.Context) {
 			Str("pos_id", c.pos.ID).
 			Float64("drop_pct", dropVal).
 			Msg("csm: liquidity warning - significant drop")
+
+		// Graduated response: partial exit proportional to severity.
+		if c.onWarning != nil && !c.warningFired["CSM_LIQUIDITY_WARNING"] {
+			c.warningFired["CSM_LIQUIDITY_WARNING"] = true
+			severity := (dropVal - c.config.LiquidityDropWarnPct) /
+				(c.config.LiquidityDropPanicPct - c.config.LiquidityDropWarnPct)
+			if severity > 1.0 {
+				severity = 1.0
+			}
+			c.onWarning(ctx, c.pos, "CSM_LIQUIDITY_WARNING", severity)
+		}
 	}
 }
 
@@ -325,6 +345,17 @@ func (c *CSM) checkHolderExodus(ctx context.Context) {
 			Str("pos_id", c.pos.ID).
 			Float64("exodus_pct", exodusPct).
 			Msg("csm: holder exodus warning - significant selling by top holders")
+
+		// Graduated response: partial exit when holders are dumping.
+		if c.onWarning != nil && !c.warningFired["CSM_HOLDER_EXODUS_WARNING"] {
+			c.warningFired["CSM_HOLDER_EXODUS_WARNING"] = true
+			warnThreshold := c.config.HolderExodusPanicPct * 0.6
+			severity := (exodusPct - warnThreshold) / (c.config.HolderExodusPanicPct - warnThreshold)
+			if severity > 1.0 {
+				severity = 1.0
+			}
+			c.onWarning(ctx, c.pos, "CSM_HOLDER_EXODUS_WARNING", severity)
+		}
 	}
 }
 

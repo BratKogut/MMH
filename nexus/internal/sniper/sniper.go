@@ -293,7 +293,7 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		if err != nil {
 			log.Error().Err(err).Str("pos_id", posID).Str("mint", string(analysis.Mint)).Msg("sniper: buy FAILED")
 			pos.Status = StatusFailed
-			// Don't track failed buy positions.
+			e.refundDailyBudget() // Refund pre-deducted budget on failure.
 			return
 		}
 
@@ -301,11 +301,10 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		pos.AmountToken = result.AmountOut
 	}
 
-	// Track spending + create exit tracker under single lock.
+	// Create exit tracker under lock (budget already pre-deducted in reserveDailyBudget).
 	e.mu.Lock()
 	e.positions[posID] = pos
 	e.trackers[posID] = NewExitTracker(posID, pos.AmountToken, e.exitEngine.config)
-	e.dailySpentSOL = e.dailySpentSOL.Add(buyAmount)
 	csmCfg := e.csmConfig
 	e.mu.Unlock()
 
@@ -321,6 +320,29 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		func(csmCtx context.Context, p *Position, reason string) {
 			e.executeSell(csmCtx, p, reason)
 		})
+
+	// Graduated response: partial exit on CSM warnings (sell 50% of remaining).
+	csm.SetOnWarning(func(warnCtx context.Context, p *Position, reason string, severity float64) {
+		sellPct := 25.0 + severity*25.0 // 25-50% based on severity
+		e.mu.RLock()
+		remaining := p.AmountToken
+		e.mu.RUnlock()
+		sellAmount := remaining.Mul(decimal.NewFromFloat(sellPct / 100.0))
+		log.Warn().
+			Str("pos_id", p.ID).
+			Str("reason", reason).
+			Float64("severity", severity).
+			Float64("sell_pct", sellPct).
+			Msg("sniper: CSM graduated response - partial sell")
+		decision := ExitDecision{
+			ShouldSell:  true,
+			SellAmount:  sellAmount,
+			SellPct:     sellPct,
+			Reason:      reason,
+			IsFullClose: false,
+		}
+		e.executePartialSell(warnCtx, p, decision)
+	})
 
 	// Wire v3.2 CSM dependencies.
 	e.mu.RLock()
@@ -396,7 +418,10 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 								log.Error().Interface("panic", rec).Str("pos_id", p.ID).Msg("sniper: sell panic recovered")
 							}
 						}()
-						e.executeSell(ctx, p, r)
+						// Use detached context so sell isn't tied to the price update caller.
+						sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer sellCancel()
+						e.executeSell(sellCtx, p, r)
 					}(pos, decision.Reason)
 				} else {
 					// For partial sells, don't change status to closing.
@@ -407,7 +432,9 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 								log.Error().Interface("panic", rec).Str("pos_id", p.ID).Msg("sniper: partial sell panic recovered")
 							}
 						}()
-						e.executePartialSell(ctx, p, d)
+						sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer sellCancel()
+						e.executePartialSell(sellCtx, p, d)
 					}(pos, decision)
 				}
 				return
@@ -420,7 +447,11 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			tpPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(e.config.TakeProfitMultiplier))
 			if priceUSD.GreaterThanOrEqual(tpPrice) {
 				pos.Status = StatusClosing
-				go e.executeSell(ctx, pos, "TAKE_PROFIT")
+				go func(p *Position) {
+					sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer sellCancel()
+					e.executeSell(sellCtx, p, "TAKE_PROFIT")
+				}(pos)
 				return
 			}
 		}
@@ -430,7 +461,11 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			trailStop := pos.HighestPrice.Sub(trailDist)
 			if priceUSD.LessThanOrEqual(trailStop) && priceUSD.GreaterThan(pos.EntryPriceUSD) {
 				pos.Status = StatusClosing
-				go e.executeSell(ctx, pos, "TRAILING_STOP")
+				go func(p *Position) {
+					sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer sellCancel()
+					e.executeSell(sellCtx, p, "TRAILING_STOP")
+				}(pos)
 				return
 			}
 		}
@@ -439,7 +474,11 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			slPrice := pos.EntryPriceUSD.Mul(decimal.NewFromFloat(1.0 - e.config.StopLossPct/100.0))
 			if priceUSD.LessThanOrEqual(slPrice) {
 				pos.Status = StatusClosing
-				go e.executeSell(ctx, pos, "STOP_LOSS")
+				go func(p *Position) {
+					sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer sellCancel()
+					e.executeSell(sellCtx, p, "STOP_LOSS")
+				}(pos)
 				return
 			}
 		}
@@ -448,7 +487,11 @@ func (e *Engine) UpdatePrice(ctx context.Context, mint solana.Pubkey, priceUSD d
 			maxAge := time.Duration(e.config.AutoSellAfterMinutes) * time.Minute
 			if time.Since(pos.OpenedAt) > maxAge {
 				pos.Status = StatusClosing
-				go e.executeSell(ctx, pos, "AUTO_SELL_TIMEOUT")
+				go func(p *Position) {
+					sellCtx, sellCancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer sellCancel()
+					e.executeSell(sellCtx, p, "AUTO_SELL_TIMEOUT")
+				}(pos)
 				return
 			}
 		}
@@ -651,7 +694,8 @@ func (e *Engine) ForceClose(ctx context.Context) {
 	}
 }
 
-// reserveDailyBudget atomically checks and reserves daily budget.
+// reserveDailyBudget atomically checks and pre-deducts daily budget.
+// Call refundDailyBudget() if the buy fails after reservation.
 func (e *Engine) reserveDailyBudget() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -677,7 +721,20 @@ func (e *Engine) reserveDailyBudget() bool {
 		return false
 	}
 
+	// Pre-deduct to prevent race between check and executeBuy.
+	e.dailySpentSOL = e.dailySpentSOL.Add(buyAmount)
 	return true
+}
+
+// refundDailyBudget refunds the pre-deducted budget on buy failure.
+func (e *Engine) refundDailyBudget() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	buyAmount := decimal.NewFromFloat(e.config.MaxBuySOL)
+	e.dailySpentSOL = e.dailySpentSOL.Sub(buyAmount)
+	if e.dailySpentSOL.IsNegative() {
+		e.dailySpentSOL = decimal.Zero
+	}
 }
 
 // Positions returns all positions.
