@@ -3,7 +3,11 @@ package scanner
 import (
 	"time"
 
+	"github.com/nexus-trading/nexus/internal/correlation"
 	"github.com/nexus-trading/nexus/internal/graph"
+	"github.com/nexus-trading/nexus/internal/honeypot"
+	"github.com/nexus-trading/nexus/internal/liquidity"
+	"github.com/nexus-trading/nexus/internal/narrative"
 	"github.com/shopspring/decimal"
 )
 
@@ -71,6 +75,12 @@ type ScoringInput struct {
 	SellSim      *SellSimResult
 	WhaleSignals []WhaleSignal
 	SocialData   *SocialData
+
+	// v3.2 Advanced Analysis inputs.
+	LiquidityFlow    *liquidity.LiquidityFlow       // from FlowAnalyzer.Analyze()
+	NarrativeState   *narrative.NarrativeState       // from Engine.GetTokenNarrative()
+	CrossTokenState  *correlation.CrossTokenState    // from Detector.GetClusterState()
+	HoneypotMatch    *honeypot.Signature             // from Tracker.CheckContract()
 }
 
 // WhaleSignal represents a whale wallet event.
@@ -104,6 +114,16 @@ func NewScorer(config ScoringConfig) *Scorer {
 func (s *Scorer) Score(input ScoringInput) TokenScore {
 	ts := TokenScore{}
 
+	// ── v3.2 Instant-Kill Checks (before scoring) ──
+	if kill, reason := s.v32InstantKill(input); kill {
+		ts.InstantKill = true
+		ts.KillReason = reason
+		ts.Total = 0
+		ts.Recommendation = "SKIP"
+		ts.Reasons = append(ts.Reasons, "INSTANT_KILL: "+reason)
+		return ts
+	}
+
 	// Dimension 1: SAFETY (30%).
 	ts.Safety, ts.InstantKill, ts.KillReason = s.scoreSafety(input)
 	if ts.InstantKill {
@@ -125,6 +145,23 @@ func (s *Scorer) Score(input ScoringInput) TokenScore {
 	// Dimension 5: TIMING (15%).
 	ts.Timing = s.scoreTiming(input)
 
+	// ── v3.2 Score Adjustments ──
+	v32Adj := s.v32ScoreAdjust(input)
+	ts.Safety += v32Adj.safetyAdj
+	ts.OnChain += v32Adj.onChainAdj
+	ts.Timing += v32Adj.timingAdj
+	ts.Entity += v32Adj.entityAdj
+
+	// Clamp all dimensions.
+	ts.Safety = clampScore(ts.Safety)
+	ts.Entity = clampScore(ts.Entity)
+	ts.Social = clampScore(ts.Social)
+	ts.OnChain = clampScore(ts.OnChain)
+	ts.Timing = clampScore(ts.Timing)
+
+	// Add v3.2 reasons.
+	ts.Reasons = append(ts.Reasons, v32Adj.reasons...)
+
 	// Correlation bonus.
 	ts.CorrelationBonus, ts.CorrelationType = s.correlationBonus(input, ts)
 
@@ -138,17 +175,93 @@ func (s *Scorer) Score(input ScoringInput) TokenScore {
 		ts.CorrelationBonus
 
 	// Clamp.
-	if ts.Total > 100 {
-		ts.Total = 100
-	}
-	if ts.Total < 0 {
-		ts.Total = 0
-	}
+	ts.Total = clampScore(ts.Total)
 
 	// Recommendation.
 	ts.Recommendation = s.recommend(ts)
 
 	return ts
+}
+
+// v32Adjustment holds score adjustments from v3.2 modules.
+type v32Adjustment struct {
+	safetyAdj  float64
+	entityAdj  float64
+	onChainAdj float64
+	timingAdj  float64
+	reasons    []string
+}
+
+// v32InstantKill checks v3.2 inputs for instant-kill conditions.
+func (s *Scorer) v32InstantKill(input ScoringInput) (bool, string) {
+	// Honeypot evolution match with high confidence.
+	if input.HoneypotMatch != nil && input.HoneypotMatch.Confidence >= 0.7 {
+		return true, "honeypot_pattern_match:" + input.HoneypotMatch.PatternID
+	}
+
+	// Liquidity rug precursor.
+	if input.LiquidityFlow != nil && input.LiquidityFlow.IsRugPrecursor() {
+		return true, "rug_precursor_detected"
+	}
+
+	// Cross-token critical risk.
+	if input.CrossTokenState != nil && input.CrossTokenState.RiskLevel == correlation.RiskCritical {
+		return true, "cross_token_critical:" + string(input.CrossTokenState.Pattern)
+	}
+
+	return false, ""
+}
+
+// v32ScoreAdjust applies v3.2 module score impacts to dimensions.
+func (s *Scorer) v32ScoreAdjust(input ScoringInput) v32Adjustment {
+	adj := v32Adjustment{}
+
+	// Liquidity flow impacts safety dimension.
+	if input.LiquidityFlow != nil {
+		impact := input.LiquidityFlow.ScoreImpact()
+		if impact != 0 {
+			adj.safetyAdj += impact
+			if impact < 0 {
+				adj.reasons = append(adj.reasons, "v32_liquidity:"+string(input.LiquidityFlow.Pattern))
+			}
+		}
+	}
+
+	// Narrative phase impacts timing dimension.
+	if input.NarrativeState != nil {
+		impact := narrative.ScoreImpact(input.NarrativeState)
+		if impact != 0 {
+			adj.timingAdj += impact
+			adj.reasons = append(adj.reasons, "v32_narrative:"+input.NarrativeState.Phase.String())
+		}
+	}
+
+	// Cross-token correlation impacts entity dimension.
+	if input.CrossTokenState != nil {
+		impact := input.CrossTokenState.ScoreImpact()
+		if impact != 0 {
+			adj.entityAdj += impact
+			adj.reasons = append(adj.reasons, "v32_correlation:"+string(input.CrossTokenState.Pattern))
+		}
+	}
+
+	// Honeypot match with moderate confidence impacts safety.
+	if input.HoneypotMatch != nil && input.HoneypotMatch.Confidence >= 0.3 && input.HoneypotMatch.Confidence < 0.7 {
+		adj.safetyAdj -= 20
+		adj.reasons = append(adj.reasons, "v32_honeypot_partial:"+input.HoneypotMatch.PatternID)
+	}
+
+	return adj
+}
+
+func clampScore(v float64) float64 {
+	if v > 100 {
+		return 100
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // scoreSafety maps our existing safety analysis to a 0-100 score.
@@ -171,11 +284,7 @@ func (s *Scorer) scoreSafety(input ScoringInput) (score float64, kill bool, kill
 		return 0, true, "honeypot_detected"
 	}
 
-	// Clamp.
-	if score > 100 {
-		score = 100
-	}
-	return score, false, ""
+	return clampScore(score), false, ""
 }
 
 // scoreEntity computes the entity dimension from the graph report.

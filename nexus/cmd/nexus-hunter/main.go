@@ -16,7 +16,11 @@ import (
 
 	"github.com/nexus-trading/nexus/internal/adapters/jupiter"
 	"github.com/nexus-trading/nexus/internal/config"
+	"github.com/nexus-trading/nexus/internal/correlation"
 	"github.com/nexus-trading/nexus/internal/graph"
+	"github.com/nexus-trading/nexus/internal/honeypot"
+	"github.com/nexus-trading/nexus/internal/liquidity"
+	"github.com/nexus-trading/nexus/internal/narrative"
 	"github.com/nexus-trading/nexus/internal/scanner"
 	"github.com/nexus-trading/nexus/internal/sniper"
 	"github.com/nexus-trading/nexus/internal/solana"
@@ -49,7 +53,7 @@ func main() {
 	setupLogging(cfg.General)
 
 	log.Info().Msg("=============================================")
-	log.Info().Msg("NEXUS Memecoin Hunter v3.1 - Starting")
+	log.Info().Msg("NEXUS Memecoin Hunter v3.2 - Starting")
 	log.Info().Msg("DETECT -> SANITIZE -> ANALYZE -> SNIPE -> PROFIT")
 	log.Info().Msg("SAFETY > PROFIT > SPEED")
 	log.Info().Msg("=============================================")
@@ -176,7 +180,20 @@ func main() {
 		Float64("timing_w", scoringConfig.Weights.Timing).
 		Msg("5D Scorer initialized")
 
-	// 6g. Create Dynamic Priority Fee Estimator (non-stub only).
+	// 6g. Create v3.2 Advanced Analysis Modules.
+	flowAnalyzer := liquidity.NewFlowAnalyzer(liquidity.DefaultFlowAnalyzerConfig())
+	log.Info().Msg("v3.2 Liquidity Flow Analyzer initialized")
+
+	narrativeEngine := narrative.NewEngine(narrative.DefaultEngineConfig(), narrative.DefaultNarratives())
+	log.Info().Msg("v3.2 Narrative Momentum Engine initialized")
+
+	honeypotTracker := honeypot.NewTracker(honeypot.DefaultEvolutionConfig())
+	log.Info().Msg("v3.2 Honeypot Evolution Tracker initialized")
+
+	correlationDetector := correlation.NewDetector(correlation.DefaultDetectorConfig())
+	log.Info().Msg("v3.2 Cross-Token Correlation Detector initialized")
+
+	// 6h. Create Dynamic Priority Fee Estimator (non-stub only).
 	var feeEstimator *solana.PriorityFeeEstimator
 	if liveRPC != nil {
 		feeEstimator = solana.NewPriorityFeeEstimator(liveRPC)
@@ -302,11 +319,56 @@ func main() {
 				Msg("[ENTITY] Deployer report")
 		}
 
+		// ── Stage 3b: v3.2 Advanced Analysis ──
+		// Liquidity flow.
+		flowAnalyzer.RecordLiquidityChange(string(analysis.Mint),
+			func() float64 { f, _ := discovery.Pool.LiquidityUSD.Float64(); return f }(),
+			true, liquidity.QualityMedium)
+		flowResult := flowAnalyzer.Analyze(string(analysis.Mint))
+
+		// Narrative classification.
+		tokenName := ""
+		if analysis.Token != nil {
+			tokenName = analysis.Token.Name
+		}
+		narrativeEngine.RecordToken(string(analysis.Mint), tokenName, string(analysis.Mint), 0)
+		narrativeState := narrativeEngine.GetTokenNarrative(tokenName, string(analysis.Mint))
+
+		// Cross-token correlation (use entity graph cluster ID if available).
+		var crossTokenState *correlation.CrossTokenState
+		if entityReport != nil && entityReport.SeedFunder != "" {
+			// Use hash of seed funder as cluster ID.
+			clusterID := uint32(0)
+			for _, b := range entityReport.SeedFunder {
+				clusterID = clusterID*31 + uint32(b)
+			}
+			mcap, _ := discovery.Pool.LiquidityUSD.Mul(decimal.NewFromInt(2)).Float64()
+			correlationDetector.RecordTokenLaunch(clusterID, string(analysis.Mint), mcap)
+			crossTokenState = correlationDetector.GetClusterState(clusterID)
+		}
+
+		// Honeypot evolution check.
+		var honeypotMatch *honeypot.Signature
+		contractData := []byte(discovery.Pool.PoolAddress)
+		if sig := honeypotTracker.CheckContract(contractData); sig != nil {
+			honeypotMatch = sig
+		}
+
+		log.Debug().
+			Str("mint", string(analysis.Mint)).
+			Str("flow_pattern", string(flowResult.Pattern)).
+			Bool("rug_precursor", flowResult.IsRugPrecursor()).
+			Msg("[v3.2] Advanced analysis")
+
 		// ── Stage 4: 5-Dimensional scoring ──
 		scoringInput := scanner.ScoringInput{
-			Analysis:     analysis,
-			EntityReport: entityReport,
-			SellSim:      &preBuySim,
+			Analysis:        analysis,
+			EntityReport:    entityReport,
+			SellSim:         &preBuySim,
+			LiquidityFlow:   &flowResult,
+			NarrativeState:  narrativeState,
+			CrossTokenState: crossTokenState,
+			HoneypotMatch:   honeypotMatch,
 		}
 		tokenScore := scorer.Score(scoringInput)
 
@@ -411,14 +473,18 @@ func main() {
 		// ── Stats ──
 		mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 			combined := map[string]any{
-				"sniper":    sniperEngine.Stats(),
-				"scanner":   tokenScanner.Stats(),
-				"jupiter":   jupAdapter.Stats(),
-				"graph":     entityGraph.Stats(),
-				"sanitizer": sanitizer.Stats(),
-				"dry_run":   dryRun,
-				"paused":    ctrl.paused.Load(),
-				"killed":    ctrl.killed.Load(),
+				"sniper":      sniperEngine.Stats(),
+				"scanner":     tokenScanner.Stats(),
+				"jupiter":     jupAdapter.Stats(),
+				"graph":       entityGraph.Stats(),
+				"sanitizer":   sanitizer.Stats(),
+				"liquidity":   flowAnalyzer.Stats(),
+				"narrative":   narrativeEngine.Stats(),
+				"honeypot":    honeypotTracker.Stats(),
+				"correlation": correlationDetector.Stats(),
+				"dry_run":     dryRun,
+				"paused":      ctrl.paused.Load(),
+				"killed":      ctrl.killed.Load(),
 			}
 			if feeEstimator != nil {
 				combined["priority_fees"] = feeEstimator.Stats()
@@ -567,8 +633,30 @@ func main() {
 		}
 	}()
 
-	log.Info().Msg("NEXUS Memecoin Hunter v3.1 - Running")
-	log.Info().Msg("Pipeline: Pool -> L0 Sanitizer -> Analyzer -> SellSim -> Entity Graph -> 5D Scorer -> Sniper")
+	// Periodic v3.2 module maintenance.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		narrativeTicker := time.NewTicker(5 * time.Minute)
+		cleanupTicker := time.NewTicker(15 * time.Minute)
+		defer narrativeTicker.Stop()
+		defer cleanupTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-narrativeTicker.C:
+				narrativeEngine.Refresh()
+			case <-cleanupTicker.C:
+				flowAnalyzer.Cleanup(1 * time.Hour)
+				correlationDetector.Cleanup(6 * time.Hour)
+			}
+		}
+	}()
+
+	log.Info().Msg("NEXUS Memecoin Hunter v3.2 - Running")
+	log.Info().Msg("Pipeline: Pool -> L0 Sanitizer -> Analyzer -> SellSim -> Entity Graph -> v3.2 Analysis -> 5D Scorer -> Sniper")
+	log.Info().Msg("v3.2 Modules: Liquidity Flow + Narrative Momentum + Honeypot Evolution + Cross-Token Correlation")
 	log.Info().Msg("Monitoring for new memecoin pools...")
 
 	// 11. Block until shutdown.
