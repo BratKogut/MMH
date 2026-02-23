@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nexus-trading/nexus/internal/adapters/jupiter"
+	"github.com/nexus-trading/nexus/internal/graph"
+	"github.com/nexus-trading/nexus/internal/honeypot"
 	"github.com/nexus-trading/nexus/internal/scanner"
 	"github.com/nexus-trading/nexus/internal/solana"
 	"github.com/rs/zerolog/log"
@@ -110,6 +112,10 @@ type Engine struct {
 	sellSim    *scanner.SellSimulator
 	csmConfig  CSMConfig
 
+	// v3.2: passed to CSM for entity re-check and honeypot retro scan.
+	graphEngine     *graph.Engine
+	honeypotTracker *honeypot.Tracker
+
 	// Daily budget tracking (protected by mu).
 	dailySpentSOL  decimal.Decimal
 	dailyLossSOL   decimal.Decimal
@@ -161,6 +167,20 @@ func (e *Engine) SetCSMConfig(config CSMConfig) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.csmConfig = config
+}
+
+// SetEntityGraph sets the entity graph engine for CSM-4 re-checks.
+func (e *Engine) SetEntityGraph(engine *graph.Engine) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.graphEngine = engine
+}
+
+// SetHoneypotTracker sets the honeypot tracker for CSM retroactive scans.
+func (e *Engine) SetHoneypotTracker(tracker *honeypot.Tracker) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.honeypotTracker = tracker
 }
 
 // SetOnPositionOpen sets callback for new positions.
@@ -301,6 +321,19 @@ func (e *Engine) executeBuy(ctx context.Context, analysis scanner.TokenAnalysis)
 		func(csmCtx context.Context, p *Position, reason string) {
 			e.executeSell(csmCtx, p, reason)
 		})
+
+	// Wire v3.2 CSM dependencies.
+	e.mu.RLock()
+	ge := e.graphEngine
+	ht := e.honeypotTracker
+	e.mu.RUnlock()
+	if ge != nil {
+		csm.SetEntityGraph(ge, string(analysis.Mint))
+	}
+	if ht != nil {
+		csm.SetHoneypotTracker(ht)
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

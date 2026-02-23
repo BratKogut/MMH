@@ -4,7 +4,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexus-trading/nexus/internal/copytrade"
+	"github.com/nexus-trading/nexus/internal/correlation"
 	"github.com/nexus-trading/nexus/internal/graph"
+	"github.com/nexus-trading/nexus/internal/honeypot"
+	"github.com/nexus-trading/nexus/internal/liquidity"
+	"github.com/nexus-trading/nexus/internal/narrative"
 	"github.com/nexus-trading/nexus/internal/solana"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -272,4 +277,226 @@ func TestScorer_TotalClamped(t *testing.T) {
 
 	assert.LessOrEqual(t, score.Total, 100.0)
 	assert.GreaterOrEqual(t, score.Total, 0.0)
+}
+
+// ---------------------------------------------------------------------------
+// v3.2 Instant-Kill Tests
+// ---------------------------------------------------------------------------
+
+func TestScorer_v32InstantKill_HoneypotHighConfidence(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+	input := newTestScoringInput()
+	input.HoneypotMatch = &honeypot.Signature{
+		PatternID:  "hp-001",
+		Confidence: 0.8,
+	}
+
+	score := scorer.Score(input)
+
+	assert.True(t, score.InstantKill)
+	assert.Equal(t, 0.0, score.Total)
+	assert.Equal(t, "SKIP", score.Recommendation)
+	assert.Contains(t, score.KillReason, "honeypot_pattern_match")
+}
+
+func TestScorer_v32InstantKill_RugPrecursor(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+	input := newTestScoringInput()
+	input.LiquidityFlow = &liquidity.LiquidityFlow{
+		Pattern: liquidity.PatternRugPrecursor,
+	}
+
+	score := scorer.Score(input)
+
+	assert.True(t, score.InstantKill)
+	assert.Equal(t, 0.0, score.Total)
+	assert.Contains(t, score.KillReason, "rug_precursor_detected")
+}
+
+func TestScorer_v32InstantKill_CrossTokenCritical(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+	input := newTestScoringInput()
+	input.CrossTokenState = &correlation.CrossTokenState{
+		RiskLevel: correlation.RiskCritical,
+		Pattern:   correlation.PatternSerial,
+	}
+
+	score := scorer.Score(input)
+
+	assert.True(t, score.InstantKill)
+	assert.Equal(t, 0.0, score.Total)
+	assert.Contains(t, score.KillReason, "cross_token_critical")
+}
+
+// ---------------------------------------------------------------------------
+// v3.2 Score Adjustment Tests
+// ---------------------------------------------------------------------------
+
+func TestScorer_v32ScoreAdjust_LiquidityFlow(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	t.Run("healthy growth boosts safety", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.LiquidityFlow = &liquidity.LiquidityFlow{
+			Pattern: liquidity.PatternHealthyGrowth,
+		}
+
+		withFlow := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutFlow := scorer.Score(input2)
+
+		assert.Greater(t, withFlow.Safety, withoutFlow.Safety)
+	})
+
+	t.Run("slow bleed penalizes safety", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.LiquidityFlow = &liquidity.LiquidityFlow{
+			Pattern: liquidity.PatternSlowBleed,
+		}
+
+		withFlow := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutFlow := scorer.Score(input2)
+
+		assert.Less(t, withFlow.Safety, withoutFlow.Safety)
+	})
+}
+
+func TestScorer_v32ScoreAdjust_NarrativePhase(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	t.Run("emerging narrative boosts timing", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.NarrativeState = &narrative.NarrativeState{
+			Phase: narrative.PhaseEmerging,
+		}
+
+		withNarr := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutNarr := scorer.Score(input2)
+
+		assert.Greater(t, withNarr.Timing, withoutNarr.Timing)
+	})
+
+	t.Run("dead narrative penalizes timing", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.NarrativeState = &narrative.NarrativeState{
+			Phase: narrative.PhaseDead,
+		}
+
+		withNarr := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutNarr := scorer.Score(input2)
+
+		assert.Less(t, withNarr.Timing, withoutNarr.Timing)
+	})
+}
+
+func TestScorer_v32ScoreAdjust_CrossTokenCorrelation(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	input := newTestScoringInput()
+	input.CrossTokenState = &correlation.CrossTokenState{
+		RiskLevel: correlation.RiskHigh,
+		Pattern:   correlation.PatternRotation,
+	}
+
+	withCorr := scorer.Score(input)
+
+	input2 := newTestScoringInput()
+	withoutCorr := scorer.Score(input2)
+
+	assert.Less(t, withCorr.Entity, withoutCorr.Entity)
+	assert.Contains(t, withCorr.Reasons, "v32_correlation:ROTATION")
+}
+
+func TestScorer_v32ScoreAdjust_HoneypotPartial(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	input := newTestScoringInput()
+	input.HoneypotMatch = &honeypot.Signature{
+		PatternID:  "hp-partial",
+		Confidence: 0.5, // between 0.3 and 0.7 = partial penalty
+	}
+
+	withPartial := scorer.Score(input)
+
+	input2 := newTestScoringInput()
+	withoutPartial := scorer.Score(input2)
+
+	assert.Less(t, withPartial.Safety, withoutPartial.Safety)
+	assert.Contains(t, withPartial.Reasons, "v32_honeypot_partial:hp-partial")
+}
+
+func TestScorer_v32ScoreAdjust_CopyTrade(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	t.Run("first move boosts onchain", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.CopyTradeSignal = &copytrade.CopySignal{
+			Signal:     copytrade.SignalFirstMove,
+			Tier:       copytrade.TierWhale,
+			Confidence: 0.8,
+		}
+
+		withSignal := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutSignal := scorer.Score(input2)
+
+		assert.Greater(t, withSignal.OnChain, withoutSignal.OnChain)
+		assert.Contains(t, withSignal.Reasons, "v32_copytrade:FIRST_MOVE")
+	})
+
+	t.Run("dump penalizes onchain", func(t *testing.T) {
+		input := newTestScoringInput()
+		input.CopyTradeSignal = &copytrade.CopySignal{
+			Signal:     copytrade.SignalDump,
+			Tier:       copytrade.TierWhale,
+			Confidence: 0.9,
+		}
+
+		withSignal := scorer.Score(input)
+
+		input2 := newTestScoringInput()
+		withoutSignal := scorer.Score(input2)
+
+		assert.Less(t, withSignal.OnChain, withoutSignal.OnChain)
+	})
+}
+
+func TestScorer_v32HoneypotBelowThreshold_NoKill(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+	input := newTestScoringInput()
+	input.HoneypotMatch = &honeypot.Signature{
+		PatternID:  "hp-low",
+		Confidence: 0.2, // below 0.3 = no impact
+	}
+
+	score := scorer.Score(input)
+	assert.False(t, score.InstantKill)
+	assert.Greater(t, score.Total, 0.0)
+}
+
+func TestScorer_SetWeights(t *testing.T) {
+	scorer := NewScorer(DefaultScoringConfig())
+
+	newWeights := ScoringWeights{
+		Safety: 0.50, Entity: 0.10, Social: 0.15, OnChain: 0.15, Timing: 0.10,
+	}
+	scorer.SetWeights(newWeights)
+
+	got := scorer.GetWeights()
+	assert.Equal(t, 0.50, got.Safety)
+	assert.Equal(t, 0.10, got.Entity)
+
+	// Verify Score uses new weights.
+	input := newTestScoringInput()
+	input.Analysis.SafetyScore = 100
+	score := scorer.Score(input)
+	assert.Greater(t, score.Total, 0.0)
 }

@@ -102,27 +102,35 @@ type SolanaConfig struct {
 	RateLimitRPS float64 `yaml:"rate_limit_rps"`
 }
 
+// TrackedWalletConfig configures a tracked wallet for copy-trade intelligence.
+type TrackedWalletConfig struct {
+	Address string `yaml:"address"`
+	Tier    string `yaml:"tier"`  // WHALE|SMART_MONEY|KOL|INSIDER|FRESH
+	Label   string `yaml:"label"` // human-readable label
+}
+
 // HunterConfig configures the memecoin hunter/sniper.
 type HunterConfig struct {
-	Enabled              bool     `yaml:"enabled"`
-	DryRun               bool     `yaml:"dry_run"`
-	MonitorDEXes         []string `yaml:"monitor_dexes"`
-	MaxBuySOL            float64  `yaml:"max_buy_sol"`
-	SlippageBps          int      `yaml:"slippage_bps"`
-	TakeProfitMultiplier float64  `yaml:"take_profit_multiplier"`
-	StopLossPct          float64  `yaml:"stop_loss_pct"`
-	TrailingStopEnabled  bool     `yaml:"trailing_stop_enabled"`
-	TrailingStopPct      float64  `yaml:"trailing_stop_pct"`
-	MaxPositions         int      `yaml:"max_positions"`
-	MaxDailyLossSOL      float64  `yaml:"max_daily_loss_sol"`
-	MaxDailySpendSOL     float64  `yaml:"max_daily_spend_sol"`
-	MinSafetyScore       int      `yaml:"min_safety_score"`
-	MinLiquidityUSD      float64  `yaml:"min_liquidity_usd"`
-	MaxTokenAgeMinutes   int      `yaml:"max_token_age_minutes"`
-	AutoSellAfterMinutes int      `yaml:"auto_sell_after_minutes"`
-	UseJito              bool     `yaml:"use_jito"`
-	JitoTipSOL           float64  `yaml:"jito_tip_sol"`
-	PriorityFee          uint64   `yaml:"priority_fee"`
+	Enabled              bool                  `yaml:"enabled"`
+	DryRun               bool                  `yaml:"dry_run"`
+	MonitorDEXes         []string              `yaml:"monitor_dexes"`
+	MaxBuySOL            float64               `yaml:"max_buy_sol"`
+	SlippageBps          int                   `yaml:"slippage_bps"`
+	TakeProfitMultiplier float64               `yaml:"take_profit_multiplier"`
+	StopLossPct          float64               `yaml:"stop_loss_pct"`
+	TrailingStopEnabled  bool                  `yaml:"trailing_stop_enabled"`
+	TrailingStopPct      float64               `yaml:"trailing_stop_pct"`
+	MaxPositions         int                   `yaml:"max_positions"`
+	MaxDailyLossSOL      float64               `yaml:"max_daily_loss_sol"`
+	MaxDailySpendSOL     float64               `yaml:"max_daily_spend_sol"`
+	MinSafetyScore       int                   `yaml:"min_safety_score"`
+	MinLiquidityUSD      float64               `yaml:"min_liquidity_usd"`
+	MaxTokenAgeMinutes   int                   `yaml:"max_token_age_minutes"`
+	AutoSellAfterMinutes int                   `yaml:"auto_sell_after_minutes"`
+	UseJito              bool                  `yaml:"use_jito"`
+	JitoTipSOL           float64               `yaml:"jito_tip_sol"`
+	PriorityFee          uint64                `yaml:"priority_fee"`
+	TrackedWallets       []TrackedWalletConfig `yaml:"tracked_wallets"`
 }
 
 // Validate checks the configuration for invalid or dangerous values.
