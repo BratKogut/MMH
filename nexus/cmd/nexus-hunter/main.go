@@ -195,7 +195,18 @@ func main() {
 	log.Info().Msg("v3.2 Cross-Token Correlation Detector initialized")
 
 	copytradeTracker := copytrade.NewTracker(copytrade.DefaultIntelConfig())
-	log.Info().Msg("v3.2 Copy-Trade Intelligence Tracker initialized")
+	for _, tw := range cfg.Hunter.TrackedWallets {
+		tier := copytrade.WalletTier(tw.Tier)
+		if tier == "" {
+			tier = copytrade.TierWhale
+		}
+		copytradeTracker.AddWallet(copytrade.TrackedWallet{
+			Address: tw.Address,
+			Tier:    tier,
+			Label:   tw.Label,
+		})
+	}
+	log.Info().Int("wallets", len(cfg.Hunter.TrackedWallets)).Msg("v3.2 Copy-Trade Intelligence Tracker initialized")
 
 	adaptiveWeights := scanner.NewAdaptiveWeightEngine(
 		scanner.DefaultAdaptiveWeightConfig(), scoringConfig.Weights)
@@ -226,12 +237,23 @@ func main() {
 	}
 	sniperEngine := sniper.NewEngine(sniperConfig, jupAdapter, rpc)
 
+	// Wire v3.2 CSM dependencies into sniper engine.
+	sniperEngine.SetEntityGraph(entityGraph)
+	sniperEngine.SetHoneypotTracker(honeypotTracker)
+
 	// Configure multi-level TP exit engine.
 	exitConfig := sniper.DefaultExitConfig()
 	exitConfig.StopLossPct = cfg.Hunter.StopLossPct
 	exitConfig.TrailingStopEnabled = cfg.Hunter.TrailingStopEnabled
 	exitConfig.TrailingStopPct = cfg.Hunter.TrailingStopPct
 	sniperEngine.SetExitConfig(exitConfig)
+
+	// Entry info cache: stores per-mint data for position close handling.
+	type entryInfo struct {
+		Score     scanner.TokenScore
+		ClusterID uint32
+	}
+	entryScores := &sync.Map{} // mint (string) -> entryInfo
 
 	// Wire position callbacks.
 	sniperEngine.SetOnPositionOpen(func(pos *sniper.Position) {
@@ -244,19 +266,50 @@ func main() {
 			Msg("[POSITION OPENED]")
 	})
 	sniperEngine.SetOnPositionClose(func(pos *sniper.Position) {
+		mint := string(pos.TokenMint)
+		isRug := pos.CloseReason == "RUG" || pos.CloseReason == "PANIC_SELL" ||
+			pos.CloseReason == "CSM_SELL_SIM_FAILED" || pos.CloseReason == "CSM_LIQUIDITY_PANIC" ||
+			pos.CloseReason == "CSM_HOLDER_EXODUS" || pos.CloseReason == "CSM_ENTITY_SERIAL_RUGGER"
+
 		log.Info().
 			Str("pos_id", pos.ID).
-			Str("mint", string(pos.TokenMint)).
+			Str("mint", mint).
 			Str("reason", pos.CloseReason).
 			Float64("pnl_pct", pos.PnLPct).
+			Bool("is_rug", isRug).
 			Msg("[POSITION CLOSED]")
 
-		// Feed outcome to adaptive weight engine.
-		adaptiveWeights.RecordOutcome(scanner.TradeOutcome{
+		// Feed outcome to adaptive weight engine with entry dimension scores.
+		outcome := scanner.TradeOutcome{
 			PnLPct: pos.PnLPct,
 			IsWin:  pos.PnLPct > 0,
-			IsRug:  pos.CloseReason == "RUG" || pos.CloseReason == "PANIC_SELL",
-		})
+			IsRug:  isRug,
+		}
+		var clusterID uint32
+		if infoVal, ok := entryScores.LoadAndDelete(mint); ok {
+			info := infoVal.(entryInfo)
+			outcome.Score = info.Score
+			clusterID = info.ClusterID
+		}
+		adaptiveWeights.RecordOutcome(outcome)
+
+		// Feed rug events back to v3.2 modules for learning.
+		if isRug {
+			// Honeypot tracker: learn from rug.
+			honeypotTracker.RecordRug(honeypot.RugSample{
+				TokenAddress: mint,
+				Chain:        "solana",
+				ContractData: []byte(pos.PoolAddress),
+				RugType:      pos.CloseReason,
+				DetectedBy:   "csm",
+				Timestamp:    time.Now().Unix(),
+			})
+
+			// Correlation detector: mark token as rugged.
+			if clusterID != 0 {
+				correlationDetector.MarkRugged(clusterID, mint)
+			}
+		}
 	})
 
 	// 8. Control state.
@@ -404,6 +457,15 @@ func main() {
 			Str("correlation", tokenScore.CorrelationType).
 			Bool("instant_kill", tokenScore.InstantKill).
 			Msg("[5D SCORE] Result")
+
+		// Cache entry info for adaptive weight learning + rug feedback.
+		var entryClusterID uint32
+		if entityReport != nil && entityReport.SeedFunder != "" {
+			for _, b := range entityReport.SeedFunder {
+				entryClusterID = entryClusterID*31 + uint32(b)
+			}
+		}
+		entryScores.Store(string(analysis.Mint), entryInfo{Score: tokenScore, ClusterID: entryClusterID})
 
 		// ── Stage 5: Decision ──
 		if tokenScore.InstantKill {
@@ -579,6 +641,55 @@ func main() {
 				"instance_id":    cfg.General.InstanceID,
 				"graph_snapshot": graph.GetSnapshotInfo(snapshotPath),
 			})
+		})
+
+		// ── Copy-Trade Wallet Management ──
+		mux.HandleFunc("/copytrade/wallets", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(copytradeTracker.GetWallets())
+			case http.MethodPost:
+				var req struct {
+					Address string `json:"address"`
+					Tier    string `json:"tier"`
+					Label   string `json:"label"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if req.Address == "" {
+					http.Error(w, "address required", http.StatusBadRequest)
+					return
+				}
+				tier := copytrade.WalletTier(req.Tier)
+				if tier == "" {
+					tier = copytrade.TierWhale
+				}
+				copytradeTracker.AddWallet(copytrade.TrackedWallet{
+					Address: req.Address,
+					Tier:    tier,
+					Label:   req.Label,
+				})
+				log.Info().Str("address", req.Address).Str("tier", string(tier)).Msg("[COPYTRADE] Wallet added")
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"status":"added","address":"%s"}`, req.Address)
+			case http.MethodDelete:
+				var req struct {
+					Address string `json:"address"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				copytradeTracker.RemoveWallet(req.Address)
+				log.Info().Str("address", req.Address).Msg("[COPYTRADE] Wallet removed")
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"status":"removed","address":"%s"}`, req.Address)
+			default:
+				http.Error(w, "GET/POST/DELETE only", http.StatusMethodNotAllowed)
+			}
 		})
 
 		port := cfg.Metrics.PrometheusPort + 2 // hunter on port +2
