@@ -1,307 +1,104 @@
-# MULTI-CHAIN MEMECOIN HUNTER v2.0 — Part 1/2
-## Architecture + Solana Adapter
+# NEXUS Memecoin Hunter v3.2 — Architecture & Pipeline
 
-**Wersja:** 2.0 | **Data:** 2026-02-09 | **SAFETY > PROFIT**
-
----
-
-## 1. POPRAWKI vs v1
-
-| Obszar | v1 (błędne) | v2 (poprawione) |
-|--------|------------|-----------------|
-| Język | Python + Node.js | **Python only** (ATLAS = 10k linii Pythona) |
-| Redis streams | `token:new` (jeden) | **`tokens:new:{chain}`** (per-chain) |
-| pump.fun | Tylko Raydium logs | **PumpPortal WS** (~70% memów, pre-graduation) |
-| Base DEX | Tylko Uniswap V3 | **Uniswap V3 + Aerodrome** (#1 TVL na Base) |
-| Security | Jeden check | **Dwupoziomowy: pre-filter (cache) + pre-execution (fresh)** |
-| WS reconnect | Prosta pętla | **Exponential backoff + circuit breaker** |
-| Dead letter | Brak | **Consumer groups + XACK + DLQ** |
-| Orca | Brak | **Orca Whirlpool logs subscription** |
+**Language:** Go 1.24 | **Chain:** Solana | **SAFETY > PROFIT > SPEED**
 
 ---
 
-## 2. HIGH-LEVEL ARCHITECTURE
+## 1. High-Level Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    MULTI-CHAIN MEMECOIN HUNTER v2.0                       │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  CHAIN ADAPTERS:                                                         │
-│  ┌──────────┐ ┌──────────┐ ┌──────┐ ┌──────┐ ┌────────┐ ┌──────┐       │
-│  │ SOLANA   │ │  BASE    │ │ BSC  │ │ TON  │ │ARBITRUM│ │ TRON │       │
-│  │pump.fun  │ │Uniswap V3│ │ PCS  │ │STON  │ │Camelot │ │SunSw │       │
-│  │PumpSwap  │ │Aerodrome │ │      │ │DeDust│ │Uni V3  │ │SunP. │       │
-│  │Raydium   │ │          │ │      │ │      │ │        │ │      │       │
-│  │Orca      │ │          │ │      │ │      │ │        │ │      │       │
-│  └────┬─────┘ └────┬─────┘ └──┬───┘ └──┬───┘ └───┬────┘ └──┬───┘       │
-│       └──────┬─────┴─────┬────┴────┬───┴────┬────┴────┬────┘           │
-│              ▼                                                           │
-│  ┌─────────────────────────────────────────────────────────────┐         │
-│  │            REDIS STREAMS (per-chain event bus)              │         │
-│  │  tokens:new:{chain} | trades:executed:{chain} | health:*   │         │
-│  └──────────────────────────┬──────────────────────────────────┘         │
-│                             │                                            │
-│       ┌─────────────────────┼────────────────────────┐                  │
-│       ▼                     ▼                        ▼                  │
-│  ┌──────────┐      ┌──────────────┐         ┌──────────────┐           │
-│  │SCORING   │─────▶│ EXECUTION    │────────▶│  POSITION    │           │
-│  │SERVICE   │      │ SERVICE      │         │  MANAGER     │           │
-│  └────┬─────┘      └──────────────┘         └──────────────┘           │
-│       ▼                                                                  │
-│  ┌──────────┐     ┌────────────────────────────────────┐                │
-│  │TELEGRAM  │     │ PostgreSQL+TimescaleDB | Redis     │                │
-│  │ALERTS    │     │ Grafana + Prometheus               │                │
-│  └──────────┘     └────────────────────────────────────┘                │
-└───────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. ZUNIFIKOWANY INTERFACE
-
-```python
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-import time
-
-class ChainId(str, Enum):
-    SOLANA = "solana"
-    BASE = "base"
-    BSC = "bsc"
-    TON = "ton"
-    ARBITRUM = "arbitrum"
-    TRON = "tron"
-
-@dataclass
-class TokenEvent:
-    chain: ChainId
-    address: str
-    name: str
-    symbol: str
-    creator: str
-    timestamp: float
-    launchpad: Optional[str] = None
-    initial_liquidity_usd: Optional[float] = None
-    pool_address: Optional[str] = None
-    dex: Optional[str] = None
-    tx_hash: Optional[str] = None
-    bonding_curve_progress: Optional[float] = None  # pump.fun: 0-100%
-
-@dataclass
-class SecurityResult:
-    is_safe: bool
-    flags: list[str]          # ["HONEYPOT", "MINTABLE", "HIGH_TAX:15%"]
-    risk_level: str           # LOW | MEDIUM | HIGH | CRITICAL
-    raw_data: dict = field(default_factory=dict)
-    checked_at: float = field(default_factory=time.time)
-    ttl_seconds: int = 30     # cache TTL
-
-@dataclass
-class SwapParams:
-    chain: ChainId
-    token_in: str
-    token_out: str
-    amount_raw: int           # lamports / wei
-    slippage_bps: int = 300
-    use_mev_protection: bool = True
-    deadline_seconds: int = 120
-
-@dataclass
-class SwapResult:
-    success: bool
-    tx_hash: str
-    amount_out: Optional[int] = None
-    price_impact_pct: Optional[float] = None
-    gas_cost_usd: Optional[float] = None
-    error: Optional[str] = None
-    confirmed: bool = False
-
-class ChainAdapter(ABC):
-    chain: ChainId
-    @abstractmethod
-    async def start(self) -> None: ...
-    @abstractmethod
-    async def stop(self) -> None: ...
-    @abstractmethod
-    async def health_check(self) -> dict: ...
-    @abstractmethod
-    async def check_security(self, address: str) -> SecurityResult: ...
-    @abstractmethod
-    async def get_price_data(self, address: str) -> dict: ...
-    @abstractmethod
-    async def execute_swap(self, params: SwapParams) -> SwapResult: ...
-```
-
-### Shared Base Class (circuit breaker + cache + Redis publish)
-
-```python
-class BaseChainAdapter(ChainAdapter):
-    def __init__(self, redis_client, config):
-        self.redis = redis_client
-        self.config = config
-        # Circuit breaker
-        self._ws_failures = 0
-        self._ws_max_failures = 5
-        self._ws_backoff_base = 2
-        self._ws_backoff_max = 60
-        self._circuit_open = False
-        # Security cache (two-level)
-        self._security_cache: dict[str, SecurityResult] = {}
-
-    def _get_reconnect_delay(self) -> float:
-        return min(self._ws_backoff_base ** self._ws_failures, self._ws_backoff_max)
-
-    async def _on_ws_failure(self, error: str):
-        self._ws_failures += 1
-        if self._ws_failures >= self._ws_max_failures:
-            self._circuit_open = True
-            await self.redis.xadd("alerts:system", {"data": json.dumps({
-                "type": "CIRCUIT_OPEN", "chain": self.chain.value, "error": error
-            })}, maxlen=1000)
-        await asyncio.sleep(self._get_reconnect_delay())
-
-    def _on_ws_success(self):
-        self._ws_failures = 0
-        self._circuit_open = False
-
-    async def check_security_cached(self, address: str) -> SecurityResult:
-        """Pre-filter: use cache if fresh (TTL-based)"""
-        cached = self._security_cache.get(address)
-        if cached and (time.time() - cached.checked_at) < cached.ttl_seconds:
-            return cached
-        result = await self.check_security(address)
-        self._security_cache[address] = result
-        return result
-
-    async def check_security_fresh(self, address: str) -> SecurityResult:
-        """Pre-execution: always fresh, bypasses cache"""
-        result = await self.check_security(address)
-        self._security_cache[address] = result
-        return result
+┌─────────────────────────────────────────────────────────────────┐
+│                    NEXUS MEMECOIN HUNTER v3.2                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  POOL DISCOVERY (WebSocket)                                     │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ Raydium V4 (675kPX9...)  │  PumpFun (6EF8rr...)  │           │
+│  │ logsSubscribe            │  logsSubscribe         │           │
+│  └────────────┬─────────────┴────────────┬──────────┘           │
+│               └──────────┬───────────────┘                      │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ L0 SANITIZER (<10ms, zero external calls)         │           │
+│  └──────────────────────┬───────────────────────────┘           │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ ANALYSIS PIPELINE                                 │           │
+│  │ TokenAnalyzer → SellSim → EntityGraph → v3.2     │           │
+│  └──────────────────────┬───────────────────────────┘           │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ 5D SCORER (adaptive weights)                      │           │
+│  │ Safety(30) + Entity(15) + Social(20)              │           │
+│  │ + OnChain(20) + Timing(15) + CorrelationBonus     │           │
+│  └──────────────────────┬───────────────────────────┘           │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ SNIPER ENGINE                                     │           │
+│  │ Budget check → Jupiter V6 → Jito bundle → Confirm │           │
+│  └──────────────────────┬───────────────────────────┘           │
+│                          ▼                                      │
+│  ┌──────────────┬───────────────────────────────────┐           │
+│  │ CSM          │ EXIT ENGINE                        │           │
+│  │ (per-pos     │ TP: 1.5x/2x/3x/6x                │           │
+│  │  goroutine)  │ SL: -50% | Trail: 20%             │           │
+│  │ SellSim      │ Timed: 4h/12h/24h                 │           │
+│  │ Holders      │ Panic: CSM triggers                │           │
+│  │ Liquidity    │                                    │           │
+│  │ Entity       │                                    │           │
+│  └──────────────┴──────────┬────────────────────────┘           │
+│                             ▼                                   │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ OUTCOME FEED → Adaptive Weights + Rug Learning   │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                 │
+│  HTTP API (:9092)                                               │
+│  /health │ /stats │ /positions │ /control/* │ /copytrade/*     │
+│                                                                 │
+│  Prometheus Metrics (:9092/metrics)                             │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. SOLANA ADAPTER — PEŁNA SPECYFIKACJA
+## 2. Solana Integration
 
-### 4.1 Endpoints
+### 2.1 Endpoints
 
 ```
-SOLANA:
-├── Helius RPC:      https://mainnet.helius-rpc.com/?api-key={KEY}
-├── Helius WS:       wss://mainnet.helius-rpc.com/?api-key={KEY}
-├── PumpPortal WS:   wss://pumpportal.fun/api/data           (FREE)
-├── PumpPortal WS:   wss://pumpportal.fun/api/data?api-key={KEY}  (PumpSwap data)
-├── PumpPortal Trade: https://pumpportal.fun/api/trade-local  (0.5% fee)
-├── Jupiter Quote:   https://quote-api.jup.ag/v6/quote
-├── Jupiter Swap:    https://quote-api.jup.ag/v6/swap
-├── Jupiter Price:   https://price.jup.ag/v6/price
-├── Birdeye:         https://public-api.birdeye.so
-├── DexScreener:     https://api.dexscreener.com/latest
-├── Jito MEV:        https://mainnet.block-engine.jito.wtf/api/v1/transactions
+Solana:
+├── RPC:         Helius mainnet (https://mainnet.helius-rpc.com/?api-key={KEY})
+├── WebSocket:   Helius WS (wss://mainnet.helius-rpc.com/?api-key={KEY})
+├── Jupiter V6:
+│   ├── Quote:   https://quote-api.jup.ag/v6/quote
+│   ├── Swap:    https://quote-api.jup.ag/v6/swap
+│   └── Price:   https://price.jup.ag/v6/price
+├── Jito MEV:    https://mainnet.block-engine.jito.wtf/api/v1/transactions
 └── Programs:
     ├── Raydium V4:  675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8
-    ├── Pump.fun:    6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-    ├── Orca:        whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc
-    └── SOL:         So11111111111111111111111111111111111111112
+    ├── PumpFun:     6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+    └── SOL (WSOL):  So11111111111111111111111111111111111111112
 ```
 
-### 4.2 Discovery — 3-Layer System
+### 2.2 RPC Client (internal/solana/)
 
-#### Layer 1: PumpPortal WebSocket (fastest, ~200ms, ~70% of new memecoins)
+**StubRPCClient** — for tests and dry-run:
+- Returns mock data for all RPC calls
+- Configurable safety scores and holder data
+- Simulates TX submission (always succeeds)
 
-```python
-# URL: wss://pumpportal.fun/api/data
-# Koszt: FREE (Data API), rate-limited
-# CRITICAL: ONE connection, multiple subscriptions
+**LiveRPCClient** — for mainnet:
+- `GetAccountInfo(mint)` — fetch mint/freeze authority
+- `GetTokenLargestAccounts(mint)` — top holders
+- `SendTransaction(rawTx)` — submit signed TX
+- Configurable rate limiting (RateLimitRPS from config)
 
-# ─── Subscribe: New token creation ────────────────
-→ SEND: {"method": "subscribeNewToken"}
+### 2.3 WebSocket Monitor (internal/solana/)
 
-# ─── Subscribe: Migration (graduation → Raydium/PumpSwap) ─
-→ SEND: {"method": "subscribeMigration"}
+Subscribes to Raydium and PumpFun program logs:
 
-# ─── Subscribe: Trades on specific token ──────────
-→ SEND: {"method": "subscribeTokenTrade", "keys": ["<MINT_CA>"]}
-
-# ─── Subscribe: Whale wallet tracking ─────────────
-→ SEND: {"method": "subscribeAccountTrade", "keys": ["<WALLET>"]}
-
-# ─── Unsubscribe ──────────────────────────────────
-→ SEND: {"method": "unsubscribeNewToken"}
-→ SEND: {"method": "unsubscribeTokenTrade", "keys": ["<MINT_CA>"]}
-
-# ─── RESPONSE: New Token Created ──────────────────
-← RECEIVE:
-{
-    "signature": "5K7x...",
-    "mint": "ABcd...pump",
-    "traderPublicKey": "7Xyz...",
-    "txType": "create",
-    "initialBuy": 69000000,
-    "bondingCurveKey": "BCur...",
-    "vTokensInBondingCurve": 1000000000,
-    "vSolInBondingCurve": 30000000,
-    "marketCapSol": 30.5,
-    "name": "DogCoin",
-    "symbol": "DOG",
-    "uri": "https://..."
-}
-
-# ─── RESPONSE: Trade on bonding curve ─────────────
-← RECEIVE:
-{
-    "signature": "3Ab...",
-    "mint": "ABcd...pump",
-    "traderPublicKey": "8Qwe...",
-    "txType": "buy",              # "buy" or "sell"
-    "tokenAmount": 50000000,
-    "marketCapSol": 33.7,
-    "vSolInBondingCurve": 32000000
-}
-
-# ─── RESPONSE: Migration (graduation) ────────────
-← RECEIVE:
-{
-    "signature": "9Mn...",
-    "mint": "ABcd...pump",
-    "txType": "migrate",
-    "pool": "RayPool...",
-    "bondingCurveKey": "BCur..."
-}
-
-# Bonding curve progress calculation:
-#   Graduation at ~85 SOL in bonding curve
-#   progress = min(100, (vSolInBondingCurve / 85e9) * 100)
-```
-
-#### Layer 2: Helius Webhooks (primary reliable, HTTP push with auto-retry)
-
-```python
-# POST https://api.helius.xyz/v0/webhooks?api-key={KEY}
-{
-    "webhookURL": "https://your-server/webhook/solana/new-pool",
-    "transactionTypes": ["SWAP"],
-    "accountAddresses": [
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium V4
-        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"     # Orca Whirlpool
-    ],
-    "webhookType": "enhanced",
-    "encoding": "jsonParsed"
-}
-# Advantage: no reconnection logic, automatic retries
-```
-
-#### Layer 3: Helius WebSocket (fallback if webhooks fail)
-
-```python
-# URL: wss://mainnet.helius-rpc.com/?api-key={KEY}
-
-# Subscribe: Raydium V4 logs
-→ SEND:
+```go
+// logsSubscribe for Raydium V4 pool creation
 {
     "jsonrpc": "2.0", "id": 1,
     "method": "logsSubscribe",
@@ -310,148 +107,348 @@ SOLANA:
         {"commitment": "confirmed"}
     ]
 }
-# Detect: "initialize2" in logs = NEW RAYDIUM POOL
 
-# Subscribe: Orca Whirlpool logs
-→ SEND:
-{
-    "jsonrpc": "2.0", "id": 2,
-    "method": "logsSubscribe",
-    "params": [
-        {"mentions": ["whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"]},
-        {"commitment": "confirmed"}
-    ]
-}
+// Detect: "initialize2" in logs = NEW RAYDIUM POOL
+```
 
-# Subscribe: Own wallet changes
-→ SEND:
-{
-    "jsonrpc": "2.0", "id": 3,
-    "method": "accountSubscribe",
-    "params": ["<WALLET>", {"encoding": "jsonParsed", "commitment": "confirmed"}]
-}
+Emits `PoolDiscovery` events with:
+- PoolAddress, DEX, LiquidityUSD
+- TokenMint, QuoteReserveSOL
+- LatencyMs from detection
 
-# Subscribe: TX confirmation
-→ SEND:
+### 2.4 Jupiter Adapter (internal/adapters/jupiter/)
+
+**V6 API Client:**
+- `GetQuote(inputMint, outputMint, amount, slippageBps)` — get swap quote
+- `GetSwapTx(quote, userPubkey)` — get serialized swap TX
+- `GetPrice(mints)` — bulk price lookup
+
+**Swap flow:**
+1. Get quote from Jupiter V6
+2. Set dynamic slippage (from config SlippageBps)
+3. Set priority fees (dynamic or configured)
+4. Build swap TX with Jito tip (if UseJito=true)
+5. Sign with wallet private key
+6. Submit via Jito bundle or standard RPC
+7. Wait for confirmation (finalized)
+
+### 2.5 Jito Bundles (internal/solana/)
+
+```go
+// Jito bundle submission
+POST https://mainnet.block-engine.jito.wtf/api/v1/transactions
 {
-    "jsonrpc": "2.0", "id": 4,
-    "method": "signatureSubscribe",
-    "params": ["<TX_SIG>", {"commitment": "confirmed"}]
+    "jsonrpc": "2.0", "id": 1,
+    "method": "sendTransaction",
+    "params": ["<BASE64_TX>"]
 }
 ```
 
-### 4.3 Token Security API Calls
+Benefits: Private mempool, no sandwich attacks.
+Dynamic tips: estimated from recent block data.
 
-```python
-# ═══ ON-CHAIN: Mint & Freeze Authority ═══════════
-# POST {HELIUS_RPC}
-{"jsonrpc":"2.0","id":1,"method":"getAccountInfo",
- "params":["<MINT>",{"encoding":"jsonParsed"}]}
-# → result.value.data.parsed.info:
-#   mintAuthority: null = SAFE, address = DANGER (can mint infinite)
-#   freezeAuthority: null = SAFE, address = DANGER (can freeze)
+### 2.6 Priority Fees (internal/solana/)
 
-# ═══ HELIUS DAS: Token Metadata ═══════════════════
-# POST {HELIUS_RPC}
-{"jsonrpc":"2.0","id":1,"method":"getAsset","params":{"id":"<MINT>"}}
-
-# ═══ Top Holders ══════════════════════════════════
-# POST {HELIUS_RPC}
-{"jsonrpc":"2.0","id":1,"method":"getTokenLargestAccounts","params":["<MINT>"]}
-
-# ═══ BIRDEYE: Token Security ═════════════════════
-# GET https://public-api.birdeye.so/defi/token_security?address={MINT}
-# Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
-# Response.data:
-{
-    "isMintable": false,          # CRITICAL
-    "isFreezable": false,         # CRITICAL
-    "top10HolderPercent": 45.2,   # >50% = warning
-    "lpBurnedPercent": 95.0       # <80% = warning
-}
-
-# ═══ BIRDEYE: Token Overview ═════════════════════
-# GET https://public-api.birdeye.so/defi/token_overview?address={MINT}
-# Headers: {"X-API-KEY": "{KEY}", "x-chain": "solana"}
-# Returns: price, volume, liquidity, priceChange, buys/sells, holders
-```
-
-### 4.4 Price Data
-
-```python
-# ═══ BIRDEYE OHLCV ═══════════════════════════════
-# GET https://public-api.birdeye.so/defi/ohlcv
-#   ?address={MINT}&type=1m&time_from={TS}&time_to={TS}
-# Intervals: 1m, 3m, 5m, 15m, 30m, 1H, 4H, 1D
-
-# ═══ DEXSCREENER (FREE, no key) ══════════════════
-# GET https://api.dexscreener.com/latest/dex/tokens/{MINT}
-# Returns: pairs[{priceUsd, volume, liquidity, priceChange, txns}]
-
-# ═══ JUPITER PRICE (FREE, bulk) ══════════════════
-# GET https://price.jup.ag/v6/price?ids={MINT1},{MINT2}&vsToken=So111...2
-```
-
-### 4.5 Trade Execution
-
-```python
-# ═══ JUPITER SWAP — Step 1: Quote ════════════════
-# GET https://quote-api.jup.ag/v6/quote
-#   ?inputMint=So111...2&outputMint={TOKEN}&amount={LAMPORTS}
-#   &slippageBps=300&dynamicSlippage=true
-
-# ═══ JUPITER SWAP — Step 2: Get TX ═══════════════
-# POST https://quote-api.jup.ag/v6/swap
-{
-    "quoteResponse": "<FULL_QUOTE>",
-    "userPublicKey": "<WALLET>",
-    "wrapAndUnwrapSol": true,
-    "dynamicComputeUnitLimit": true,
-    "dynamicSlippage": true,
-    "prioritizationFeeLamports": {
-        "priorityLevelWithMaxLamports": {
-            "maxLamports": 5000000,
-            "priorityLevel": "veryHigh"
-        }
-    }
-}
-# Response: {"swapTransaction": "<BASE64_TX>"}
-
-# ═══ Step 3: Sign & Send ═════════════════════════
-# A) Standard RPC (faster, MEV-exposed):
-#    POST {HELIUS_RPC} → sendTransaction
-# B) Jito MEV Protection (recommended):
-#    POST https://mainnet.block-engine.jito.wtf/api/v1/transactions
-#    → sendTransaction (private mempool, no sandwich)
-
-# ═══ PUMPPORTAL: Bonding Curve Trade ═════════════
-# For tokens STILL ON bonding curve (pre-graduation)
-# POST https://pumpportal.fun/api/trade-local
-{
-    "publicKey": "<WALLET>",
-    "action": "buy",
-    "mint": "<TOKEN_CA>",
-    "denominatedInSol": "true",
-    "amount": 0.1,
-    "slippage": 15,
-    "priorityFee": 0.00001,
-    "pool": "pump"
-}
-# Returns raw TX bytes → sign locally → send via RPC/Jito
-# Fee: 0.5% per trade
-
-# ═══ TX Confirmation ═════════════════════════════
-# POST {HELIUS_RPC}
-{"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses",
- "params":[["<SIG>"],{"searchTransactionHistory":true}]}
-# → confirmationStatus: "confirmed" / "finalized", err: null = OK
-
-# ═══ HELIUS Enhanced TX parsing ═══════════════════
-# POST https://api.helius.xyz/v0/transactions/?api-key={KEY}
-{"transactions": ["<SIG>"]}
-# Returns: full parsed swap details, token transfers, fees
+```go
+// Percentile-based priority fee estimation
+// Fetches recent priority fees from RPC
+// Returns fee at configured percentile (default: p75)
+// Capped at configured maximum
 ```
 
 ---
 
-*Continued in Part 2: Base Adapter + Scoring + Execution + Infrastructure*
+## 3. Pipeline Stages
+
+### 3.1 L0 Sanitizer (scanner/sanitizer.go)
+
+**Purpose:** Instant reject of obviously bad tokens. < 10ms, zero external calls.
+
+**Checks:**
+- MinLiquidityUSD (default 500 USD)
+- MinQuoteReserveSOL (default 1.0 SOL)
+- Deployer history (spam filter — N launches in M minutes)
+- DEX whitelist (only configured DEXes)
+- MaxTokenAgeMinutes (reject old pools)
+
+**Result:** PASS or DROP with reason.
+
+### 3.2 Token Analyzer (scanner/analyzer.go)
+
+**Purpose:** Deep safety analysis with external API calls.
+
+**Checks:**
+1. **Mint Authority** — null = safe, present = can mint infinite tokens
+2. **Freeze Authority** — null = safe, present = can freeze wallets
+3. **LP Burn/Lock** — percentage of LP tokens burned (higher = safer)
+4. **Holder Concentration** — top-10 holder percentage (lower = safer)
+5. **Single Holder Max** — largest single holder percentage
+6. **Liquidity Depth** — USD value of pool liquidity
+
+**Output:** `TokenAnalysis` with SafetyScore (0-100), Verdict, Flags[], HolderAnalysis.
+
+### 3.3 Sell Simulator (scanner/sellsim.go)
+
+**Purpose:** Pre-buy honeypot detection by simulating a sell.
+
+**Process:**
+1. Simulate selling MaxBuySOL worth of tokens
+2. Check if sell would succeed (CanSell)
+3. Estimate sell tax percentage
+4. Detect slippage anomalies
+
+**Output:** `SellSimResult` with CanSell, EstimatedTaxPct, SlippagePct.
+
+### 3.4 Entity Graph Engine (graph/engine.go)
+
+**Purpose:** Deployer risk assessment through wallet relationship analysis.
+
+**Process:**
+1. BFS traversal from deployer wallet (depth 2)
+2. Build adjacency graph (nodes + edges)
+3. Label propagation (SERIAL_RUGGER, CLEAN, CEX_HOT_WALLET, etc.)
+4. Sybil detection (cluster size threshold)
+5. Measure hops to known ruggers/insiders
+6. Identify seed funder
+
+**Features:**
+- Max 500K nodes in memory
+- CEX hot wallet database (Binance, Coinbase, Kraken, etc.)
+- Persistence: periodic snapshots to disk + restore on startup
+- Thread-safe concurrent access
+
+**Output:** `EntityReport` with RiskScore (0-100), Labels[], ClusterSize, HopsToRugger, SeedFunder.
+
+### 3.5 v3.2 Analysis Modules
+
+#### Liquidity Flow Direction (liquidity/flow.go)
+
+Tracks net liquidity flow in 5min and 30min windows.
+
+**Patterns:**
+- HEALTHY_GROWTH — steady organic inflow
+- ARTIFICIAL_PUMP — spike from single source
+- RUG_PRECURSOR — outflow acceleration (instant kill)
+- SLOW_BLEED — gradual outflow
+- STABLE — balanced flow
+
+**Velocity:** ACCELERATING, DECELERATING, STABLE
+
+#### Narrative Momentum (narrative/engine.go)
+
+Tracks meme narrative lifecycle across tokens.
+
+**Default narratives:** AI_AGENTS, POLITICAL, ANIMAL_MEME, CELEBRITY, DEFI_META, GAMING, RWA
+
+**Phases:** EMERGING -> GROWING -> PEAK -> DECLINING -> DEAD
+
+**Metrics:** TokenCount1h/6h/24h, AvgPerformance, BestPerformer, Velocity
+
+#### Honeypot Evolution Tracker (honeypot/evolution.go)
+
+Learns honeypot patterns from rug samples.
+
+**Process:**
+1. SHA256 fingerprint contract data
+2. Match against known signatures
+3. Learn from rug samples (RecordRug)
+4. Retroactive scan on new signature detection
+
+**Signature types:** bytecode, instruction, behavior
+
+#### Cross-Token Correlation (correlation/crosstoken.go)
+
+Detects coordinated token launches by same deployer/funder.
+
+**Patterns:**
+- ROTATION — dump token A, launch token B
+- DISTRACTION — launch decoy while rugpulling main
+- SERIAL — repeated launch-and-rug pattern
+- NONE — independent tokens
+
+**Risk levels:** LOW -> MEDIUM -> HIGH -> CRITICAL (instant kill)
+
+#### Copy-Trade Intelligence (copytrade/tracker.go)
+
+Tracks whale and smart money wallets.
+
+**Wallet tiers:** WHALE, SMART_MONEY, KOL, INSIDER, FRESH
+
+**Signals:** BUY, SELL, ACCUMULATE, DUMP, FIRST_MOVE
+
+**Management:** Config-based loading + HTTP API (GET/POST/DELETE /copytrade/wallets)
+
+### 3.6 5-Dimensional Scorer (scanner/scoring.go)
+
+**Dimensions:**
+| Dimension | Weight | Source |
+|-----------|--------|--------|
+| Safety | 30% | TokenAnalyzer + SellSim |
+| Entity | 15% | EntityGraph |
+| Social | 20% | NarrativeMomentum |
+| OnChain | 20% | LiquidityFlow + CopyTrade |
+| Timing | 15% | PoolAge + Narrative + CopyTrade |
+
+**v3.2 Instant-Kill Conditions (score = 0):**
+- Honeypot match confidence >= 0.7
+- Liquidity flow pattern = RUG_PRECURSOR
+- Cross-token risk level = CRITICAL
+
+**v3.2 Score Adjustments:**
+- Liquidity flow: HEALTHY_GROWTH boosts safety, SLOW_BLEED penalizes
+- Narrative: EMERGING boosts timing, DEAD penalizes
+- Correlation: penalty proportional to risk level
+- Honeypot: partial penalty for low-confidence matches
+- Copy-trade: FIRST_MOVE boosts onchain, DUMP penalizes
+
+**Adaptive Weights:**
+- Recalculated every 30 minutes from TradeOutcome data
+- Configurable learning rate (default 0.05)
+- Window size (default 50 recent trades)
+- Thread-safe via sync.RWMutex
+
+**Recommendations:** STRONG_BUY | BUY | WAIT | SKIP | RUG | HONEYPOT
+
+### 3.7 Sniper Engine (sniper/sniper.go)
+
+**Pre-buy checks:**
+1. Daily spend budget (MaxDailySpendSOL)
+2. Daily loss limit (MaxDailyLossSOL)
+3. Position count limit (MaxPositions)
+4. SafetyScore >= MinSafetyScore
+5. Recommendation check
+
+**Buy execution:**
+1. Jupiter V6 quote
+2. Slippage calculation
+3. Priority fee estimation (dynamic)
+4. Jito tip calculation (dynamic, if enabled)
+5. TX build + sign
+6. Submit via Jito or standard RPC
+7. Wait for confirmation
+8. Create Position record
+
+### 3.8 CSM — Continuous Safety Monitor (sniper/csm.go)
+
+Per-position goroutine, runs until position closes.
+
+**Checks (every 30 seconds):**
+1. **Sell Simulation** — re-simulate sell, check for honeypot changes
+2. **Holder Exodus** — monitor top-10 holders, panic on mass dump
+3. **Liquidity Health** — check for sudden liquidity drops
+4. **Entity Re-Check** — re-query deployer, catch new rug labels
+
+**Config:**
+```go
+CSMConfig{
+    SellSimIntervalS:       30,
+    PriceCheckIntervalS:    5,
+    LiquidityDropPanicPct:  50,
+    LiquidityDropWarnPct:   30,
+    MaxSellTaxPct:          10,
+    HolderExodusEnabled:    true,
+    HolderCheckTopN:        10,
+    HolderExodusPanicPct:   30,
+    EntityReCheckEnabled:   true,
+    EntityReCheckIntervalS: 60,
+    EntityRiskPanicScore:   85,
+}
+```
+
+### 3.9 Exit Engine (sniper/exits.go)
+
+**Take Profit (4 levels, partial sells):**
+| Level | Multiplier | Sell % |
+|-------|-----------|--------|
+| 1 | 1.5x | 25% |
+| 2 | 2.0x | 25% |
+| 3 | 3.0x | 25% |
+| 4 | 6.0x | 100% |
+
+**Stop Loss:** -50% from entry price
+
+**Trailing Stop:** 20% from highest observed price (if enabled)
+
+**Timed Exits:**
+| After | Sell % |
+|-------|--------|
+| 4 hours | 50% |
+| 12 hours | 75% |
+| 24 hours | 100% |
+
+**Panic Exits:** Triggered by CSM (sell sim failed, liquidity drop, holder exodus, entity re-check)
+
+---
+
+## 4. Self-Learning Feedback Loop
+
+On every position close:
+
+```
+Position Close
+    │
+    ▼
+Determine if RUG:
+  CloseReason ∈ {RUG, PANIC_SELL, CSM_SELL_SIM_FAILED,
+                  CSM_LIQUIDITY_PANIC, CSM_HOLDER_EXODUS,
+                  CSM_ENTITY_SERIAL_RUGGER}
+    │
+    ▼
+Create TradeOutcome:
+  - Score (full TokenScore at entry, from entryInfo cache)
+  - PnLPct
+  - IsWin (PnL > 0)
+  - IsRug
+    │
+    ├──▶ AdaptiveWeights.RecordOutcome(outcome)
+    │    └── Adjusts 5D weights based on dimension-PnL correlation
+    │
+    └──▶ If isRug:
+         ├── honeypotTracker.RecordRug(sample)
+         │   └── Learn new honeypot signatures
+         │
+         └── correlationDetector.MarkRugged(clusterID, mint)
+             └── Update cluster risk level
+```
+
+---
+
+## 5. HTTP Control Plane
+
+**Port:** PrometheusPort + 2 (default 9092)
+
+### Health & Stats
+- `GET /health` — `{status, dry_run, paused, killed}`
+- `GET /stats` — combined stats from all modules
+- `GET /positions` — all positions (open + closed)
+- `GET /positions/open` — currently open positions
+
+### Control
+- `POST /control/pause` — soft pause (stop new entries, manage existing)
+- `POST /control/resume` — resume from pause
+- `POST /control/kill` — hard kill (force close all, halt)
+- `GET /control/status` — `{paused, killed, dry_run, instance_id, open_positions}`
+
+### Copy-Trade Management
+- `GET /copytrade/wallets` — list tracked wallets
+- `POST /copytrade/wallets` — add wallet `{address, tier, label}`
+- `DELETE /copytrade/wallets` — remove wallet `{address}`
+
+---
+
+## 6. Periodic Maintenance
+
+| Interval | Task |
+|----------|------|
+| 30 seconds | Log stats |
+| 5 minutes | NarrativeEngine.Refresh() |
+| 5 minutes | EntityGraph.SnapshotLoop() |
+| 10 minutes | Sanitizer.CleanupDeployerHistory() |
+| 15 minutes | FlowAnalyzer.Cleanup(1h) |
+| 15 minutes | CorrelationDetector.Cleanup(6h) |
+| 15 minutes | CopytradeTracker.Cleanup(30m) |
+| 30 minutes | AdaptiveWeights.Recalculate() → Scorer.SetWeights() |
+
+---
+
+*Last Updated: 2026-02-23*

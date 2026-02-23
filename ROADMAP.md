@@ -1,434 +1,254 @@
-# Project Roadmap
-
-Multi-Chain Memecoin Hunter v2.0 Development Roadmap
+# NEXUS Memecoin Hunter - Development Roadmap
 
 ## Overview
 
-This roadmap outlines the planned development phases from MVP to production-ready system. Timelines are estimates and subject to change based on priorities and feedback.
+Development roadmap for the NEXUS Memecoin Hunter, a Solana-focused memecoin sniping engine built in Go 1.24. The project follows sprint-based delivery where each sprint ends with a working, tested system.
 
 ---
 
-## Phase 1: MVP (2-3 weeks)
+## Sprint Status
 
-**Goal:** Functional system for Solana + Base with core features
-
-### Week 1: Solana Discovery & Security
-
-- [x] Project structure and documentation
-- [ ] SolanaAdapter — PumpPortal WebSocket
-  - [ ] New token creation events
-  - [ ] Bonding curve trade tracking
-  - [ ] Migration (graduation) detection
-  - [ ] Whale wallet tracking
-
-- [ ] SolanaAdapter — Helius WebSocket fallback
-  - [ ] Raydium V4 pool creation
-  - [ ] Orca Whirlpool monitoring
-  - [ ] Account subscription
-  - [ ] TX confirmation tracking
-
-- [ ] SolanaAdapter — Security Analysis
-  - [ ] On-chain checks (mint/freeze authority)
-  - [ ] Birdeye security API integration
-  - [ ] Birdeye token overview
-  - [ ] Top holders analysis
-
-- [ ] Redis Streams Infrastructure
-  - [ ] Per-chain event streams
-  - [ ] Consumer groups setup
-  - [ ] Dead letter queue implementation
-
-**Deliverables:**
-- Working Solana token discovery
-- Security validation pipeline
-- Redis event bus
-
-### Week 2: Base Discovery & Scoring
-
-- [ ] BaseAdapter — WebSocket Monitoring
-  - [ ] Uniswap V3 PoolCreated logs
-  - [ ] Aerodrome V2 PoolCreated logs
-  - [ ] New token identification
-  - [ ] Liquidity depth tracking
-
-- [ ] BaseAdapter — Security Analysis
-  - [ ] GoPlus security API integration
-  - [ ] Tax level detection
-  - [ ] Honeypot detection
-  - [ ] Basescan verification (optional)
-
-- [ ] Scoring Service (Basic)
-  - [ ] Chain-specific weight configuration
-  - [ ] Risk score calculation
-  - [ ] Momentum score calculation
-  - [ ] Overall score aggregation
-  - [ ] Recommendation engine
-
-- [ ] Telegram Alerts
-  - [ ] Bot setup and authentication
-  - [ ] Alert formatting
-  - [ ] Real-time notifications
-
-**Deliverables:**
-- Working Base token discovery
-- Scoring system
-- Telegram integration
-
-### Week 3: Execution & Position Management
-
-- [ ] Execution Service
-  - [ ] Score validation
-  - [ ] Balance checking
-  - [ ] Position checking
-  - [ ] Fresh security checks
-  - [ ] Position sizing logic
-
-- [ ] Jupiter Swap Execution (Solana)
-  - [ ] Quote API integration
-  - [ ] TX building
-  - [ ] Jito MEV protection
-  - [ ] TX confirmation
-
-- [ ] Uniswap V3 Swap Execution (Base)
-  - [ ] 0x aggregator integration
-  - [ ] TX building via web3.py
-  - [ ] Gas estimation
-  - [ ] TX confirmation
-
-- [ ] Position Manager
-  - [ ] Position creation
-  - [ ] TP/SL tracking
-  - [ ] Position status management
-  - [ ] P&L calculation
-
-- [ ] Database Setup
-  - [ ] PostgreSQL + TimescaleDB
-  - [ ] Schema creation
-  - [ ] Hypertable setup
-  - [ ] Indexes
-
-- [ ] Reliability Features
-  - [ ] Circuit breaker implementation
-  - [ ] Exponential backoff
-  - [ ] Health checks
-  - [ ] Error handling
-
-**Deliverables:**
-- End-to-end trade execution
-- Position tracking
-- Production database
-- Monitoring infrastructure
+| Sprint | Name | Status | LOC | Tests |
+|--------|------|--------|-----|-------|
+| S0 | Foundation | DONE | ~3,000 | 45 |
+| S1 | Market Data Pipeline | DONE | ~6,000 | 95 |
+| S2 | Trading Core + Risk | DONE | ~10,000 | 150 |
+| S3 | Backtest + Research | DONE | ~14,000 | 200 |
+| S4 | Intel Pipeline | DONE | ~18,000 | 250 |
+| S5 | Memecoin Hunter Core | DONE | ~22,000 | 350 |
+| S5.5 | v3.1 Advanced Modules | DONE | ~26,000 | 420 |
+| S6 | Live Solana Integration | DONE | ~30,000 | 470 |
+| S6.5 | v3.2 Advanced Analysis | DONE | ~34,000 | 497 |
+| **S7** | **Paper Marathon** | **NEXT** | - | - |
+| S8 | Live Trading | PENDING | - | - |
 
 ---
 
-## Phase 2: Semi-Automation (2 weeks)
+## S0: Foundation (DONE)
 
-**Goal:** Add automation features and improve monitoring
+**Goal**: Repo, schemas, CI, infrastructure running.
 
-### Features
-
-- [ ] Telegram Commands
-  - [ ] `/buy <token>` — Manual buy
-  - [ ] `/sell <position_id>` — Manual sell
-  - [ ] `/positions` — List open positions
-  - [ ] `/portfolio` — Portfolio summary
-  - [ ] `/settings` — Configuration
-
-- [ ] Position Manager Enhancements
-  - [ ] TP/SL monitoring loop
-  - [ ] Auto stop-loss execution
-  - [ ] Partial exit on TP
-  - [ ] Trailing stop (optional)
-  - [ ] Max holding time enforcement
-
-- [ ] Portfolio Tracking
-  - [ ] Real-time P&L
-  - [ ] Win rate tracking
-  - [ ] Risk metrics
-  - [ ] Portfolio summary
-
-- [ ] Dead Letter Queue
-  - [ ] Failed message handling
-  - [ ] Retry mechanism
-  - [ ] DLQ monitoring
-
-- [ ] Grafana Dashboard
-  - [ ] Real-time metrics
-  - [ ] Position heatmap
-  - [ ] P&L chart
-  - [ ] Alert history
-  - [ ] System health
-
-- [ ] Prometheus Metrics
-  - [ ] Trade metrics
-  - [ ] API latency
-  - [ ] Error rates
-  - [ ] Queue depths
-
-**Deliverables:**
-- Semi-automated trading
-- Advanced monitoring
-- Portfolio dashboard
+- [x] Go monorepo layout (cmd/ + internal/)
+- [x] Kafka/RedPanda schemas (md/exec/intel/signals)
+- [x] ClickHouse table definitions
+- [x] Structured JSON logging with trace IDs
+- [x] Configuration system (YAML + validation)
+- [x] Makefile + build pipeline
 
 ---
 
-## Phase 3: Multi-Chain Expansion (2-3 weeks)
+## S1: Market Data Pipeline (DONE)
 
-**Goal:** Support additional blockchains
+**Goal**: Stable data stream from exchanges.
 
-### BSC Adapter
-
-- [ ] PancakeSwap integration
-  - [ ] Pool creation monitoring
-  - [ ] New token detection
-  - [ ] Liquidity tracking
-
-- [ ] Security Analysis
-  - [ ] GoPlus security checks
-  - [ ] PinkSale audit verification
-  - [ ] Tax detection
-
-- [ ] Execution
-  - [ ] PancakeSwap swap execution
-  - [ ] MEV considerations
-  - [ ] Gas optimization
-
-### TON Adapter
-
-- [ ] STON.fi + DeDust integration
-  - [ ] Pool creation monitoring
-  - [ ] Jetton detection
-  - [ ] Liquidity tracking
-
-- [ ] Security Analysis
-  - [ ] Jetton compliance check
-  - [ ] Creator history
-  - [ ] Telegram presence
-
-- [ ] Execution
-  - [ ] Swap execution
-  - [ ] TX confirmation
-
-### Cross-Chain Features
-
-- [ ] Portfolio aggregation
-  - [ ] Cross-chain P&L
-  - [ ] Total exposure
-  - [ ] Chain-specific metrics
-
-- [ ] Advanced Scoring
-  - [ ] Wallet analysis
-  - [ ] Social sentiment
-  - [ ] Creator reputation
-  - [ ] Community size
-
-- [ ] Bonding Curve Sniper
-  - [ ] Early detection
-  - [ ] Buy on curve
-  - [ ] Sell on graduation
-  - [ ] Automated TP/SL
-
-**Deliverables:**
-- BSC + TON support
-- Cross-chain portfolio
-- Advanced scoring
+- [x] Kraken adapter (WebSocket v2: ticks, trades, orderbook)
+- [x] Kafka producer (franz-go)
+- [x] ClickHouse batch writer
+- [x] Data quality monitor (feed lag, gaps, jitter)
+- [x] Feature engine v1 (VWAP, spread, volatility, momentum, imbalance)
+- [x] Prometheus metrics exporter
 
 ---
 
-## Phase 4: Hardening & Optimization (ongoing)
+## S2: Trading Core + Risk + Paper (DONE)
 
-**Goal:** Production-ready system with advanced features
+**Goal**: Deterministic execution path, paper trading works.
 
-### Additional Chains
+- [x] Order state machine (idempotent)
+- [x] Paper broker (simulates fills)
+- [x] Risk engine (pre-trade checks, exposure limits, daily loss limits)
+- [x] Kill switches (global, per-strategy, in-process atomic)
+- [x] Circuit breakers (feed lag, error rate)
+- [x] Execution engine (order routing, retry, partial fills)
+- [x] Position manager (per-strategy + global netting)
+- [x] Audit trail (full trace from signal to fill)
 
-- [ ] Arbitrum Adapter
-  - [ ] Camelot integration
-  - [ ] Uniswap V3 support
-  - [ ] Flashbots MEV protection
+---
 
-- [ ] Tron Adapter
-  - [ ] SunSwap integration
-  - [ ] SunPump support
-  - [ ] Execution optimization
+## S3: Backtest + Research (DONE)
 
-### Advanced Features
+**Goal**: Same logic in backtest as in paper/live.
 
-- [ ] Full Automation
-  - [ ] Auto-trading mode
-  - [ ] Risk management
-  - [ ] Portfolio rebalancing
-  - [ ] Dynamic sizing
+- [x] Replay runner (event store -> strategy runtime)
+- [x] Backtest engine (ClickHouse -> event replay -> metrics)
+- [x] Slippage + fee models (pluggable, per-exchange)
+- [x] Metrics: PnL, Sharpe, drawdown, turnover
+- [x] Regime detector v1 (HMM, 3 states)
+- [x] Binance adapter (second CEX)
 
-- [ ] Web Dashboard
-  - [ ] React frontend
-  - [ ] Real-time updates
-  - [ ] Position management
-  - [ ] Settings UI
+---
 
-- [ ] Backtesting Engine
-  - [ ] Historical data replay
-  - [ ] Scoring validation
-  - [ ] Parameter optimization
-  - [ ] Performance analysis
+## S4: Intel Pipeline (DONE)
 
-- [ ] ML-Based Scoring
-  - [ ] Model training
-  - [ ] Feature engineering
-  - [ ] Prediction accuracy
-  - [ ] Continuous learning
+**Goal**: LLM-powered market intelligence with measurable ROI.
 
-### Optimization
+- [x] Intel taxonomy (25 topics with TTL and budgets)
+- [x] Query Brain (Go orchestrator)
+- [x] Trigger engine (market anomaly + schedule)
+- [x] Budget manager (per-topic, per-provider, per-day)
+- [x] Circuit breakers per LLM provider
+- [x] Intel service with ROI tracking
+- [x] ClickHouse intel writer
 
-- [ ] Performance
-  - [ ] Query optimization
-  - [ ] Cache improvements
-  - [ ] Connection pooling
-  - [ ] Batch processing
+---
 
-- [ ] Reliability
-  - [ ] Redundancy
-  - [ ] Failover mechanisms
-  - [ ] Data backup
-  - [ ] Disaster recovery
+## S5: Memecoin Hunter Core (DONE)
 
-- [ ] Security
-  - [ ] Audit
-  - [ ] Penetration testing
-  - [ ] Key rotation
-  - [ ] Access control
+**Goal**: End-to-end pool detection -> scoring -> sniping.
 
-**Deliverables:**
-- Production-ready system
-- Advanced features
-- Optimization complete
+- [x] Token Scanner (WebSocket pool discovery)
+- [x] Token Analyzer (safety checks, LP burn, holder concentration)
+- [x] Basic scoring (safety + momentum)
+- [x] Sniper engine (Jupiter V6 integration)
+- [x] Position management (open/close lifecycle)
+- [x] Solana RPC client (stub + live)
+- [x] Jupiter adapter (quote/swap/price)
+- [x] Jito bundle support
+
+---
+
+## S5.5: v3.1 Advanced Modules (DONE)
+
+**Goal**: Advanced analysis modules for deeper risk assessment.
+
+- [x] Entity Graph Engine (wallet clustering, BFS traversal, label propagation)
+- [x] Sybil detection (cluster size thresholds)
+- [x] CEX hot wallet database (exclude known exchanges)
+- [x] 5-Dimensional Scoring (Safety + Entity + Social + OnChain + Timing)
+- [x] Sell Simulator (pre-buy honeypot detection)
+- [x] Continuous Safety Monitor (CSM) per position
+- [x] Advanced Exit Engine (4-level TP + trailing stop + timed exits)
+- [x] L0 Sanitizer (sub-10ms, zero external calls)
+- [x] Dynamic priority fees
+- [x] Dynamic Jito tips
+- [x] Entity graph persistence (snapshot/restore)
+- [x] Control plane HTTP API (/health, /stats, /positions, /control/*)
+
+---
+
+## S6: Live Solana Integration (DONE)
+
+**Goal**: Working connection to Solana mainnet RPC/WebSocket.
+
+- [x] LiveRPCClient (getAccountInfo, getTokenLargestAccounts, sendTransaction)
+- [x] WebSocket monitor (logsSubscribe for Raydium/PumpFun)
+- [x] Transaction builder (Jupiter swap TX)
+- [x] Jito bundle submission
+- [x] TX confirmation tracking
+- [x] Priority fee estimation (percentile-based)
+
+---
+
+## S6.5: v3.2 Advanced Analysis (DONE)
+
+**Goal**: Self-learning analysis modules, full pipeline integration.
+
+### Modules
+- [x] Liquidity Flow Direction Analysis
+  - Net flow tracking (5min/30min windows)
+  - Pattern detection: HEALTHY_GROWTH, ARTIFICIAL_PUMP, RUG_PRECURSOR, SLOW_BLEED
+  - Velocity: ACCELERATING / DECELERATING / STABLE
+- [x] Narrative Momentum Engine
+  - 7 default narratives (AI_AGENTS, POLITICAL, ANIMAL_MEME, etc.)
+  - Phase lifecycle: EMERGING -> GROWING -> PEAK -> DECLINING -> DEAD
+  - Token count trends (1h/6h/24h)
+- [x] Honeypot Evolution Tracker
+  - SHA256 contract fingerprinting
+  - Pattern learning from rug samples
+  - Retroactive scan on new signature detection
+- [x] Cross-Token Correlation Detector
+  - Cluster-based tracking (same deployer/funder)
+  - Pattern detection: ROTATION, DISTRACTION, SERIAL
+  - Risk levels: LOW -> MEDIUM -> HIGH -> CRITICAL
+- [x] Copy-Trade Intelligence
+  - Wallet tiers: WHALE, SMART_MONEY, KOL, INSIDER, FRESH
+  - Signal generation: BUY, SELL, ACCUMULATE, DUMP, FIRST_MOVE
+  - Config-based wallet loading + HTTP API
+- [x] Adaptive Scoring Weights
+  - Learns from TradeOutcome (PnL + dimension scores)
+  - 30-minute recalculation cycle
+  - Configurable learning rate and window size
+
+### Integration
+- [x] v3.2 instant-kill checks (honeypot >= 0.7, rug precursor, cross-token CRITICAL)
+- [x] v3.2 score adjustments (liquidity flow, narrative phase, correlation, honeypot partial, copytrade)
+- [x] CSM enhanced (holder exodus, entity re-check, honeypot retro scan)
+- [x] Rug feedback loop (honeypot.RecordRug + correlation.MarkRugged on position close)
+- [x] Entry score cache for adaptive weight training
+- [x] 12 v3.2 scoring integration tests
+- [x] All 497 tests passing with race detector
+
+---
+
+## S7: Paper Marathon (NEXT)
+
+**Goal**: 2-4 weeks dry-run on Solana mainnet, measuring everything.
+
+### Planned
+- [ ] Connect to mainnet in dry-run mode
+- [ ] Monitor scoring accuracy vs actual token outcomes
+- [ ] Track signal-to-noise ratio (how many STRONG_BUY vs actual winners)
+- [ ] Measure detection latency (pool creation -> score ready)
+- [ ] Validate CSM triggers (false positive rate)
+- [ ] Tune scoring weights with real data
+- [ ] Tune exit engine parameters
+- [ ] Weekly performance reports
+- [ ] Alerting pipeline (system health, missed opportunities)
+- [ ] Runbooks for top 10 failure modes
+
+### Success Criteria
+- 2 weeks continuous operation without critical failures
+- Detection latency < 5s from pool creation to score
+- False positive rate < 30% on STRONG_BUY signals
+- CSM catches > 80% of actual rugs before -50% loss
+- Adaptive weights show convergence
+
+---
+
+## S8: Live Trading (PENDING)
+
+**Goal**: Live trading with small capital, hard safety limits.
+
+### Planned
+- [ ] Enable live execution (remove dry-run flag)
+- [ ] Start with minimal capital (0.05 SOL max per trade)
+- [ ] Hard limits (not configurable):
+  - max_daily_loss: X SOL
+  - max_daily_spend: Y SOL
+  - max_positions: 3
+- [ ] Auto-stop on limit breach
+- [ ] Daily P&L tracking
+- [ ] Weekly review: keep / kill / modify parameters
+- [ ] Gradual capital increase based on performance
+
+### Success Criteria
+- Limits enforced 100% of the time
+- Full audit trail for every trade
+- Positive expected value after 2 weeks
+- Stability > PnL (prefer $0 over bugs)
 
 ---
 
 ## Future Considerations
 
-### Potential Features
+### Near-term
+- Telegram alerts for STRONG_BUY signals
+- Grafana dashboard for real-time monitoring
+- PumpPortal WebSocket integration (pre-graduation trades)
+- Bonding curve sniper (buy on curve, sell on graduation)
 
-- [ ] Options trading
-- [ ] Leverage trading
-- [ ] Arbitrage detection
-- [ ] Flash loan opportunities
-- [ ] Yield farming
-- [ ] Staking integration
-- [ ] NFT market monitoring
-- [ ] DAO governance tracking
+### Medium-term
+- Base chain adapter (Uniswap V3 + Aerodrome)
+- BSC adapter (PancakeSwap)
+- Multi-chain portfolio tracking
+- ML-based scoring model
 
-### Potential Chains
-
-- [ ] Polygon
-- [ ] Optimism
-- [ ] Avalanche
-- [ ] Fantom
-- [ ] Harmony
-- [ ] Cosmos chains
-
-### Integrations
-
-- [ ] Discord bot
-- [ ] Twitter/X integration
-- [ ] Email alerts
-- [ ] SMS notifications
-- [ ] Webhook support
-- [ ] API for third-party tools
+### Long-term
+- Web dashboard (React)
+- Social sentiment analysis
+- Cross-chain correlation analysis
+- Full automation with dynamic risk management
 
 ---
 
-## Success Metrics
-
-### Phase 1
-- ✅ Detect 100+ new tokens daily
-- ✅ Execute trades with <5s latency
-- ✅ 95%+ security check accuracy
-- ✅ Zero critical bugs
-
-### Phase 2
-- ✅ 50+ active positions tracked
-- ✅ <1% false positive rate
-- ✅ 99.9% uptime
-- ✅ <100ms alert latency
-
-### Phase 3
-- ✅ Support 6+ blockchains
-- ✅ 1000+ tokens analyzed daily
-- ✅ Cross-chain portfolio tracking
-- ✅ Advanced scoring with 70%+ accuracy
-
-### Phase 4
-- ✅ Production-ready system
-- ✅ 99.99% uptime
-- ✅ <50ms execution latency
-- ✅ Profitable trading record
-
----
-
-## Known Limitations & Challenges
-
-### Technical
-
-1. **API Rate Limits**
-   - Multiple providers needed for redundancy
-   - Caching strategies required
-   - Batch processing optimization
-
-2. **Network Latency**
-   - Solana: ~200ms for token detection
-   - Base: ~500ms for pool creation
-   - Optimization needed for faster execution
-
-3. **Slippage & MEV**
-   - Sandwich attacks on BSC/Arbitrum
-   - Liquidity depth limitations
-   - Dynamic fee adjustment needed
-
-4. **Database Scaling**
-   - Time-series data growth
-   - Query optimization
-   - Archive strategy
-
-### Operational
-
-1. **API Key Management**
-   - Rotation strategy
-   - Backup providers
-   - Monitoring
-
-2. **Monitoring & Alerting**
-   - Alert fatigue
-   - False positives
-   - Escalation procedures
-
-3. **Risk Management**
-   - Portfolio limits
-   - Position sizing
-   - Stop-loss execution
-
----
-
-## Timeline
-
-| Phase | Duration | Start | End |
-|-------|----------|-------|-----|
-| Phase 1 (MVP) | 2-3 weeks | Feb 2026 | Mid-Feb 2026 |
-| Phase 2 (Semi-Auto) | 2 weeks | Mid-Feb 2026 | Late Feb 2026 |
-| Phase 3 (Expansion) | 2-3 weeks | Late Feb 2026 | Early Mar 2026 |
-| Phase 4 (Hardening) | Ongoing | Mar 2026 | Ongoing |
-
----
-
-## Feedback & Changes
-
-This roadmap is subject to change based on:
-- User feedback
-- Market conditions
-- Technical constraints
-- Priority shifts
-
-Please open issues or discussions for suggestions!
-
----
-
-*Last Updated: 2026-02-09*
+*Last Updated: 2026-02-23*
