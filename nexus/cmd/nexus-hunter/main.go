@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"os"
 	"os/signal"
@@ -255,6 +256,16 @@ func main() {
 	}
 	entryScores := &sync.Map{} // mint (string) -> entryInfo
 
+	// Duplicate mint detection: prevents processing same token concurrently.
+	processingMints := &sync.Map{} // mint (string) -> bool
+
+	// fnvHash32 computes FNV-1a hash for cluster ID generation.
+	fnvHash32 := func(s string) uint32 {
+		h := fnv.New32a()
+		h.Write([]byte(s))
+		return h.Sum32()
+	}
+
 	// Wire position callbacks.
 	sniperEngine.SetOnPositionOpen(func(pos *sniper.Position) {
 		log.Info().
@@ -332,6 +343,14 @@ func main() {
 			return
 		}
 
+		// Duplicate mint detection: skip if already processing this token.
+		mint := string(discovery.Pool.TokenMint)
+		if _, loaded := processingMints.LoadOrStore(mint, true); loaded {
+			log.Debug().Str("mint", mint).Msg("[SKIP] Duplicate mint already in pipeline")
+			return
+		}
+		defer processingMints.Delete(mint)
+
 		log.Info().
 			Str("pool", string(discovery.Pool.PoolAddress)).
 			Str("dex", discovery.Pool.DEX).
@@ -405,11 +424,7 @@ func main() {
 		// Cross-token correlation (use entity graph cluster ID if available).
 		var crossTokenState *correlation.CrossTokenState
 		if entityReport != nil && entityReport.SeedFunder != "" {
-			// Use hash of seed funder as cluster ID.
-			clusterID := uint32(0)
-			for _, b := range entityReport.SeedFunder {
-				clusterID = clusterID*31 + uint32(b)
-			}
+			clusterID := fnvHash32(entityReport.SeedFunder)
 			mcap, _ := discovery.Pool.LiquidityUSD.Mul(decimal.NewFromInt(2)).Float64()
 			correlationDetector.RecordTokenLaunch(clusterID, string(analysis.Mint), mcap)
 			crossTokenState = correlationDetector.GetClusterState(clusterID)
@@ -458,15 +473,6 @@ func main() {
 			Bool("instant_kill", tokenScore.InstantKill).
 			Msg("[5D SCORE] Result")
 
-		// Cache entry info for adaptive weight learning + rug feedback.
-		var entryClusterID uint32
-		if entityReport != nil && entityReport.SeedFunder != "" {
-			for _, b := range entityReport.SeedFunder {
-				entryClusterID = entryClusterID*31 + uint32(b)
-			}
-		}
-		entryScores.Store(string(analysis.Mint), entryInfo{Score: tokenScore, ClusterID: entryClusterID})
-
 		// ── Stage 5: Decision ──
 		if tokenScore.InstantKill {
 			log.Warn().
@@ -484,11 +490,32 @@ func main() {
 			return
 		}
 
+		// Price impact check: reject if our buy would move the pool too much.
+		buySOL := decimal.NewFromFloat(cfg.Hunter.MaxBuySOL)
+		if !discovery.Pool.QuoteReserve.IsZero() {
+			impactPct, _ := buySOL.Div(discovery.Pool.QuoteReserve).Mul(decimal.NewFromInt(100)).Float64()
+			if impactPct > 10.0 {
+				log.Info().
+					Str("mint", string(analysis.Mint)).
+					Float64("impact_pct", impactPct).
+					Msg("[SKIP] Buy price impact too high (>10%)")
+				return
+			}
+		}
+
 		// Re-check control state before execution.
 		if ctrl.killed.Load() || ctrl.paused.Load() {
 			log.Info().Str("mint", string(analysis.Mint)).Msg("[SKIP] System paused/killed")
 			return
 		}
+
+		// Cache entry info for adaptive weight learning + rug feedback.
+		// Only cache for tokens that actually pass all checks and go to sniper.
+		var entryClusterID uint32
+		if entityReport != nil && entityReport.SeedFunder != "" {
+			entryClusterID = fnvHash32(entityReport.SeedFunder)
+		}
+		entryScores.Store(string(analysis.Mint), entryInfo{Score: tokenScore, ClusterID: entryClusterID})
 
 		// Feed to sniper for buy decision.
 		sniperEngine.OnDiscovery(ctx, analysis)
