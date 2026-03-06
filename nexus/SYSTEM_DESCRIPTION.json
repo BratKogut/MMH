@@ -1,0 +1,546 @@
+{
+  "project": {
+    "name": "NEXUS Memecoin Hunter",
+    "version": "3.2",
+    "language": "Go 1.24",
+    "repository": "github.com/BratKogut/MMH",
+    "motto": "SAFETY > PROFIT > SPEED",
+    "description": "Zautomatyzowana platforma do wykrywania i snajpowania memecoinów na blockchainie Solana. System analizuje nowe pule płynności, filtruje tokeny przez wielowarstwowy pipeline bezpieczeństwa, i automatycznie kupuje/sprzedaje z wielopoziomowym TP/SL."
+  },
+
+  "architecture": {
+    "pattern": "Event-Driven Pipeline",
+    "diagram": "Pool Discovery → L0 Sanitizer → Analyzer → SellSim → Entity Graph → v3.2 Analysis → 5D Scorer → Sniper Engine → Exit Engine (CSM)",
+    "concurrency_model": "Goroutine per position + shared state via sync.RWMutex",
+    "data_persistence": {
+      "kafka": "Event streaming (ticks, trades, signals)",
+      "clickhouse": "Time-series storage (analytics, audit trail)",
+      "gob_snapshots": "Entity graph state persistence (co 5 minut)"
+    }
+  },
+
+  "binaries": {
+    "nexus-hunter": {
+      "path": "cmd/nexus-hunter/main.go",
+      "description": "Główny proces memecoin huntera — wykrywa, analizuje i snajpuje nowe tokeny na Solanie",
+      "lines": 860,
+      "responsibilities": [
+        "Wiring całego pipeline: Scanner → L0 → Analyzer → SellSim → EntityGraph → v3.2 Modules → 5D Scorer → Sniper",
+        "HTTP API: /health, /stats, /positions, /control/pause|resume|kill, /copytrade/wallets",
+        "Periodic maintenance: graph snapshots, deployer cleanup, adaptive weight recalculation",
+        "Graceful shutdown: ForceClose all positions, save graph snapshot"
+      ],
+      "http_endpoints": [
+        {"path": "/health", "method": "GET", "description": "Status systemu, dry_run, paused/killed"},
+        {"path": "/stats", "method": "GET", "description": "Statystyki wszystkich modułów (sniper, scanner, jupiter, graph, sanitizer, v3.2 modules)"},
+        {"path": "/positions", "method": "GET", "description": "Wszystkie pozycje (otwarte + zamknięte)"},
+        {"path": "/positions/open", "method": "GET", "description": "Tylko otwarte pozycje"},
+        {"path": "/control/pause", "method": "POST", "description": "Wstrzymaj nowe wejścia (istniejące pozycje zarządzane dalej)"},
+        {"path": "/control/resume", "method": "POST", "description": "Wznów działanie"},
+        {"path": "/control/kill", "method": "POST", "description": "KILL SWITCH — zamknij wszystkie pozycje natychmiast"},
+        {"path": "/control/status", "method": "GET", "description": "Stan kontroli + graph snapshot info"},
+        {"path": "/copytrade/wallets", "method": "GET/POST/DELETE", "description": "Zarządzanie śledzonymi portfelami (whale, smart_money, kol, insider)"}
+      ]
+    },
+    "nexus-core": {
+      "path": "cmd/nexus-core/main.go",
+      "description": "Market data service — streamuje dane z giełd CEX (Kraken, Binance) przez Kafka + ClickHouse",
+      "responsibilities": [
+        "Adapter multi-exchange (Kraken, Binance)",
+        "Kafka producer (ticki, trade'y)",
+        "ClickHouse writer (time-series)",
+        "Feature engine (VWAP, momentum, volatility)",
+        "Quality monitor"
+      ]
+    },
+    "nexus-intel": {
+      "path": "cmd/nexus-intel/main.go",
+      "description": "Intelligence pipeline — analiza LLM tokenów + anomaly detection",
+      "responsibilities": [
+        "Brain (LLM queries z circuit breaker)",
+        "TriggerEngine (wykrywanie anomalii)",
+        "ROI Tracker (powiązanie PnL z kosztem intelligence)",
+        "Kafka consumer + ClickHouse intel writer"
+      ]
+    }
+  },
+
+  "pipeline_stages": {
+    "stage_0_l0_sanitizer": {
+      "file": "internal/scanner/sanitizer.go",
+      "lines": 387,
+      "budget": "<10ms, ZERO external API calls",
+      "target_rejection_rate": "~85%",
+      "description": "Szybki pre-filtr eliminujący oczywiste scamy ZANIM zaczniemy kosztowne analizy",
+      "filters": [
+        {
+          "id": "F1",
+          "name": "Blacklist Check",
+          "latency": "~0.1ms",
+          "description": "Sprawdza mint tokenu na liście znanych scammerów"
+        },
+        {
+          "id": "F2",
+          "name": "Name Pattern Filter",
+          "latency": "~0.1ms",
+          "description": "Regex honeypot patterns (SafeMoon, ElonCum, FreeAirdrop), impersonation (bitcoin, solana, usdc), Unicode tricks (Cyrillic 0x0400-0x04FF)"
+        },
+        {
+          "id": "F3",
+          "name": "Authority Check",
+          "latency": "~0.1ms",
+          "description": "Freeze authority active = instant kill (ktoś może zamrozić twoje tokeny)"
+        },
+        {
+          "id": "F4",
+          "name": "Liquidity Check",
+          "latency": "~0.1ms",
+          "description": "Min liquidity USD + min SOL quote reserve (z in-memory pool state)"
+        },
+        {
+          "id": "F5",
+          "name": "Entity Graph Check",
+          "latency": "~2ms",
+          "description": "1-hop do SERIAL_RUGGER = kill, Sybil cluster > 20 = kill, WASH_TRADER label = kill. Zwraca deployer address (SeedFunder) dla F6"
+        },
+        {
+          "id": "F6",
+          "name": "Deployer History",
+          "latency": "~0.1ms",
+          "description": "Ile tokenów deployer stworzył w 24h — >5 = reject (serial deployer spam). Używa prawdziwego deployer z entity graph"
+        }
+      ],
+      "config": {
+        "MinLiquidityUSD": 500,
+        "MinQuoteReserveSOL": 1.0,
+        "MaxDeployerTokens24h": 5,
+        "SybilClusterThreshold": 20
+      }
+    },
+
+    "stage_1_safety_analysis": {
+      "file": "internal/scanner/analyzer.go",
+      "description": "Pełna analiza bezpieczeństwa tokenu (wymaga RPC calls)",
+      "checks": [
+        "Holder distribution (top 10, single holder %, concentration)",
+        "Mint authority (renounced = safe)",
+        "Freeze authority (renounced = safe)",
+        "LP safety (burned or locked)",
+        "Liquidity depth",
+        "Token age"
+      ],
+      "output": {
+        "SafetyScore": "0-100 (min 40 do kupna)",
+        "Verdict": "BUY | WAIT | SKIP | RUG | HONEYPOT",
+        "SafetyFlags": "Lista indywidualnych ryzyk"
+      }
+    },
+
+    "stage_2_sell_simulation": {
+      "file": "internal/scanner/sellsim.go",
+      "lines": 140,
+      "description": "Symulacja sprzedaży PRZED kupnem — weryfikacja czy token nie jest honeypot (nie da się sprzedać)",
+      "math": "Constant product AMM: x * y = k z 0.25% pool fee",
+      "checks": [
+        "Czy pool ma rezerwy (QuoteReserve > 0, TokenReserve > 0)",
+        "Czy sell nie zdrenuje >90% quote reserves",
+        "Estymacja sell tax z price impact (>50% impact = podejrzany)",
+        "Price impact naszego buy na pool (>10% = reject)"
+      ],
+      "pool_fee": "0.25% (0.9975 multiplier) — Raydium/Orca standard"
+    },
+
+    "stage_3_entity_graph": {
+      "file": "internal/graph/engine.go",
+      "description": "In-memory graf 500k nodeów — mapuje powiązania między portfelami, deployerami, ruggerami",
+      "query_time": "<2ms",
+      "capabilities": [
+        "QueryDeployer — risk score, labels, cluster size, hops to rugger/insider",
+        "DetectSybilCluster — wykrywa grupy powiązanych portfeli",
+        "DetectFundingTree — śledzi kto funduje kogo",
+        "Label propagation — SERIAL_RUGGER, WASH_TRADER, SYBIL_CLUSTER, PROFITABLE_INSIDER, CEX"
+      ],
+      "persistence": "GOB snapshot co 5 minut (SnapshotLoop)",
+      "eviction": "LRU gdy >MaxNodes (500k)"
+    },
+
+    "stage_3b_v32_advanced_analysis": {
+      "description": "Moduły v3.2 — zaawansowana analiza ponad standardowy safety check",
+      "modules": {
+        "liquidity_flow": {
+          "file": "internal/liquidity/flow.go",
+          "description": "Analiza wzorców płynności: HEALTHY_GROWTH vs ARTIFICIAL_PUMP vs SLOW_BLEED vs RUG_PRECURSOR",
+          "patterns": ["HEALTHY_GROWTH", "ARTIFICIAL_PUMP", "SLOW_BLEED", "RUG_PRECURSOR", "LP_UNLOCK_RISK", "NORMAL"],
+          "metrics": ["direction (INFLOW/OUTFLOW/STABLE)", "velocity (ACCELERATING/DECELERATING)", "source quality (HIGH/MEDIUM/LOW)"]
+        },
+        "narrative_momentum": {
+          "file": "internal/narrative/engine.go",
+          "description": "Śledzenie cykli życia narratyw memecoinowych: EMERGING → GROWING → PEAK → DECLINING → DEAD",
+          "built_in_narratives": ["AI_AGENTS", "POLITICAL", "ANIMAL_MEME", "CELEBRITY", "DEFI_META", "GAMING", "RWA"],
+          "phases": ["EMERGING", "GROWING", "PEAK", "DECLINING", "DEAD"],
+          "use_case": "Kupuj tokeny w fazie EMERGING/GROWING, unikaj PEAK/DECLINING"
+        },
+        "honeypot_evolution": {
+          "file": "internal/honeypot/evolution.go",
+          "description": "Uczenie się wzorców honeypotów z rug events — pattern matching na contract data",
+          "capabilities": [
+            "RecordRug — uczy się nowych wzorców z rug sampli",
+            "CheckContract — sprawdza czy kontrakt pasuje do known patterns",
+            "RetroactiveScan — skanuje istniejące pozycje pod kątem nowych wzorców"
+          ],
+          "max_patterns": 2000,
+          "min_confidence": 0.3
+        },
+        "cross_token_correlation": {
+          "file": "internal/correlation/crosstoken.go",
+          "description": "Wykrywanie powiązań między tokenami: ROTATION, DISTRACTION, SERIAL rug patterns",
+          "patterns": {
+            "ROTATION": "Ten sam deployer wypuszcza nowe tokeny co kilka godzin, stare dumpi",
+            "DISTRACTION": "Nowy token maskuje dump starego",
+            "SERIAL": "Seryjny rugger — >3 tokeny z tego samego seed fundera"
+          },
+          "cluster_id": "FNV-1a hash z SeedFunder address"
+        },
+        "copy_trade_intel": {
+          "file": "internal/copytrade/tracker.go",
+          "description": "Śledzenie whale/smart money portfeli — sygnały BUY/SELL/ACCUMULATE/DUMP/FIRST_MOVE",
+          "wallet_tiers": ["WHALE (>10 SOL)", "SMART_MONEY", "KOL", "INSIDER", "FRESH"],
+          "signal_types": ["BUY", "SELL", "ACCUMULATE", "DUMP", "FIRST_MOVE"]
+        },
+        "adaptive_weights": {
+          "file": "internal/scanner/adaptive.go",
+          "description": "Dynamiczna rekalibracja wag 5D scorera na podstawie trade outcomes (co 30 minut)",
+          "dimensions": ["Safety", "Entity", "Social", "OnChain", "Timing"],
+          "learning": "Feeduje wynik (win/loss/rug) + dimension scores do rekalibracji"
+        }
+      }
+    },
+
+    "stage_4_5d_scoring": {
+      "file": "internal/scanner/scorer.go (referenced)",
+      "description": "5-wymiarowy scoring łączący wszystkie sygnały w jedną decyzję",
+      "dimensions": {
+        "Safety": {"weight": "configurable", "source": "Analyzer (holder distribution, authority, LP)"},
+        "Entity": {"weight": "configurable", "source": "Entity Graph (deployer risk, labels, hops)"},
+        "Social": {"weight": "configurable", "source": "Narrative momentum, copy-trade signals"},
+        "OnChain": {"weight": "configurable", "source": "Liquidity flow, sell simulation"},
+        "Timing": {"weight": "configurable", "source": "Pool age, narrative phase"}
+      },
+      "output": {
+        "Total": "0-100 combined score",
+        "Recommendation": "BUY | WAIT | SKIP",
+        "InstantKill": "true/false (absolute rejection — rugger, honeypot pattern, rug precursor)",
+        "KillReason": "string (why instant killed)",
+        "CorrelationType": "ROTATION | DISTRACTION | SERIAL | NONE"
+      },
+      "adaptive": "Wagi rekalibrowane co 30 minut przez AdaptiveWeightEngine"
+    },
+
+    "stage_5_decision": {
+      "location": "cmd/nexus-hunter/main.go:461-515",
+      "description": "Finalna decyzja kupna z dodatkowym safety gatekeeping",
+      "gates": [
+        {"check": "InstantKill", "action": "SKIP — absolute rejection"},
+        {"check": "Recommendation == SKIP|WAIT", "action": "SKIP — score too low"},
+        {"check": "Price Impact > 10%", "action": "SKIP — nasz buy za bardzo przesunie pool"},
+        {"check": "System paused/killed", "action": "SKIP — control plane override"},
+        {"check": "Duplicate mint in pipeline", "action": "SKIP — ten sam token już jest przetwarzany"}
+      ],
+      "on_pass": "Cache entry info → sniperEngine.OnDiscovery()"
+    }
+  },
+
+  "sniper_engine": {
+    "file": "internal/sniper/sniper.go",
+    "lines": 758,
+    "description": "Engine zarządzający kupnem/sprzedażą pozycji z auto TP/SL",
+
+    "entry_flow": {
+      "function": "OnDiscovery(ctx, analysis)",
+      "steps": [
+        "1. reserveDailyBudget() — atomiczne sprawdzenie + pre-dedukcja budżetu (race-safe)",
+        "2. Check position limit (MaxPositions, default 5)",
+        "3. Check safety score (>= MinSafetyScore, default 40)",
+        "4. Check verdict (must be BUY)",
+        "5. executeBuy() — Jupiter swap SOL → Token",
+        "6. Create ExitTracker + start CSM goroutine",
+        "7. Notify onPositionOpen callback"
+      ],
+      "budget_safety": "Pre-deduct w reserveDailyBudget + refundDailyBudget na buy failure"
+    },
+
+    "position_management": {
+      "struct": "Position",
+      "fields": [
+        "ID (uuid[:12])",
+        "TokenMint, PoolAddress, DEX",
+        "EntryPriceUSD, CurrentPrice, HighestPrice",
+        "AmountToken, CostSOL",
+        "PnLPct, SafetyScore",
+        "BuySignature, SellSignature",
+        "Status (OPEN → CLOSING → CLOSED | FAILED)",
+        "OpenedAt, ClosedAt, CloseReason",
+        "SellRetries (max 3)"
+      ]
+    },
+
+    "exit_engine": {
+      "file": "internal/sniper/exits.go",
+      "lines": 319,
+      "description": "Wielopoziomowy TP/SL z partial sells",
+      "evaluation_priority": [
+        "1. STOP_LOSS (full close at -50%)",
+        "2. Multi-level TAKE_PROFIT (4 levels: +50%→25%, +100%→25%, +200%→25%, +500%→100%)",
+        "3. TRAILING_STOP (20% from high, only after first TP hit)",
+        "4. TIMED_EXIT (4h→50%, 12h→75%, 24h→100%)"
+      ],
+      "tp_levels": [
+        {"level": 1, "multiplier": 1.5, "sell_pct": 25, "description": "+50%: sprzedaj 25% pozycji"},
+        {"level": 2, "multiplier": 2.0, "sell_pct": 25, "description": "+100%: sprzedaj 25% pozycji"},
+        {"level": 3, "multiplier": 3.0, "sell_pct": 25, "description": "+200%: sprzedaj 25% pozycji"},
+        {"level": 4, "multiplier": 6.0, "sell_pct": 100, "description": "+500%: sprzedaj resztę"}
+      ],
+      "tracker": {
+        "struct": "ExitTracker",
+        "tracks": "TPLevelsHit[], TimedExitsHit[], RemainingPct, OriginalAmount"
+      }
+    },
+
+    "continuous_safety_monitor": {
+      "file": "internal/sniper/csm.go",
+      "lines": 422,
+      "description": "Dedykowana goroutine per pozycja — ciągle monitoruje bezpieczeństwo po kupnie",
+      "checks": [
+        {
+          "id": "CSM-1",
+          "name": "Sell Simulation",
+          "interval": "30s",
+          "description": "Symuluje sell naszej pozycji — wykrywa honeypot activation (token stał się niesprzedawalny) lub wzrost sell tax",
+          "panic_on": "CanSell=false LUB EstimatedTaxPct > 10%"
+        },
+        {
+          "id": "CSM-2",
+          "name": "Holder Exodus",
+          "interval": "30s",
+          "description": "Śledzi top 10 holderów — czy masowo wyprzedają",
+          "panic_on": "Exodus >= 30% (top holders sprzedali >30% swoich tokenów)",
+          "warning_on": "Exodus >= 18% (graduated response: partial sell 25-50%)"
+        },
+        {
+          "id": "CSM-3",
+          "name": "Liquidity Health",
+          "interval": "30s",
+          "description": "Porównuje obecną liquidity z entry liquidity",
+          "panic_on": "Liquidity drop >= 50%",
+          "warning_on": "Liquidity drop >= 30% (graduated response: partial sell 25-50%)"
+        },
+        {
+          "id": "CSM-4",
+          "name": "Entity Graph Re-Check",
+          "interval": "60s",
+          "description": "Re-query entity graph — deployer mógł zostać nowo oznaczony jako SERIAL_RUGGER",
+          "panic_on": "Deployer labeled SERIAL_RUGGER LUB risk score spike (>85 i +20 vs entry)",
+          "includes": "Honeypot retroactive scan (nowe wzorce dopasowane do naszego tokenu)"
+        }
+      ],
+      "graduated_response": {
+        "description": "Zamiast binarnego OK/PANIC, CSM trigguje partial sells na warning levels",
+        "mechanism": "onWarning callback z severity (0.0-1.0)",
+        "sell_range": "25% (severity=0) do 50% (severity=1) pozycji",
+        "dedup": "Każdy warning type triggeruje się max raz per pozycja (warningFired map)"
+      },
+      "close_reasons": [
+        "CSM_SELL_SIM_FAILED", "CSM_TAX_INCREASE", "CSM_LIQUIDITY_PANIC",
+        "CSM_HOLDER_EXODUS", "CSM_ENTITY_SERIAL_RUGGER", "CSM_ENTITY_RISK_SPIKE",
+        "CSM_HONEYPOT_RETROACTIVE", "CSM_LIQUIDITY_WARNING", "CSM_HOLDER_EXODUS_WARNING"
+      ]
+    },
+
+    "execution": {
+      "buy": "Jupiter SwapDirect (SOL → Token) via Raydium/Orca/PumpFun",
+      "sell": "Jupiter SwapDirect (Token → SOL) z retry (max 3)",
+      "partial_sell": "Sell N% of remaining amount, update AmountToken",
+      "priority_fee": "100,000 lamports (dynamic via PriorityFeeEstimator)",
+      "jito": "Optional Jito bundle for MEV protection",
+      "dry_run": "Symuluje buy/sell bez real transactions (DRYRUN-BUY-xxx, DRYRUN-SELL-xxx)",
+      "sell_context": "Detached context.Background() + 60s timeout (nie zależy od caller context)"
+    },
+
+    "daily_limits": {
+      "MaxDailySpendSOL": {"default": 2.0, "description": "Max SOL wydane dziennie na kupna"},
+      "MaxDailyLossSOL": {"default": 1.0, "description": "Max SOL stracone dziennie (trigger stop)"},
+      "reset": "UTC midnight",
+      "race_protection": "Pre-deduct w reserveDailyBudget, refund na buy failure"
+    }
+  },
+
+  "solana_integration": {
+    "rpc": {
+      "file": "internal/solana/rpc.go + live_rpc.go",
+      "interface": "RPCClient",
+      "methods": [
+        "GetTokenInfo(mint) — metadata (name, symbol, supply, authorities)",
+        "GetTopHolders(mint, limit) — top N token holders",
+        "GetWalletBalance(wallet) — SOL + SPL balances",
+        "GetRecentPools(dex, sinceMinutes) — new pool discoveries",
+        "GetPoolInfo(poolAddress) — live pool reserves + price",
+        "SubscribeNewPools(dex) — WebSocket real-time pool feed",
+        "SendTransaction(txBase64) — submit signed transaction",
+        "Health() — RPC connectivity check"
+      ],
+      "rate_limiting": "Configurable RPS limit",
+      "retry": "Max 3 retries z exponential backoff",
+      "stub_mode": "StubRPCClient for testing without real Solana connection"
+    },
+    "websocket": {
+      "file": "internal/solana/ws_monitor.go",
+      "description": "Real-time pool monitoring via Solana WebSocket (programSubscribe)"
+    },
+    "priority_fees": {
+      "file": "internal/solana/priority_fees.go",
+      "description": "Dynamic priority fee estimation from recent block data (P25/P50/P75 percentiles)"
+    },
+    "jito": {
+      "file": "internal/solana/jito.go",
+      "description": "Jito bundle submission for MEV protection"
+    },
+    "jupiter": {
+      "file": "internal/adapters/jupiter/",
+      "description": "Jupiter DEX aggregator adapter — optimal routing across Raydium, Orca, PumpFun, Meteora",
+      "features": ["SwapDirect (fastest path)", "Slippage protection (default 2%)", "Priority fee injection", "Jito bundle support"]
+    }
+  },
+
+  "configuration": {
+    "file": "internal/config/config.go",
+    "format": "YAML (config/config.yaml)",
+    "key_sections": {
+      "general": ["instance_id", "environment (dev/staging/prod)", "dry_run", "log_level", "log_format"],
+      "solana": ["rpc_endpoint", "ws_endpoint", "private_key", "wallet_pubkey", "rate_limit_rps"],
+      "hunter": {
+        "trading": ["max_buy_sol", "slippage_bps", "priority_fee", "use_jito", "jito_tip_sol"],
+        "strategy": ["take_profit_multiplier", "stop_loss_pct", "trailing_stop_enabled", "trailing_stop_pct"],
+        "limits": ["max_positions", "max_daily_loss_sol", "max_daily_spend_sol", "auto_sell_after_minutes"],
+        "filters": ["min_safety_score", "min_liquidity_usd", "max_token_age_minutes", "monitor_dexes"],
+        "copytrade": ["tracked_wallets (address, tier, label)"]
+      },
+      "kafka": ["brokers", "producer/consumer configs"],
+      "clickhouse": ["dsn", "database"],
+      "metrics": ["prometheus_port"]
+    },
+    "validation": "cfg.Validate() — checks required fields, value ranges"
+  },
+
+  "safety_layers": {
+    "description": "System ma 7 warstw bezpieczeństwa — token musi przejść WSZYSTKIE aby być kupionym",
+    "layers": [
+      {"layer": 1, "name": "L0 Sanitizer", "stage": "Pre-analysis", "cost": "<10ms, 0 API calls", "rejection": "~85%"},
+      {"layer": 2, "name": "Safety Analyzer", "stage": "Analysis", "cost": "RPC calls", "rejection": "Safety score < 40"},
+      {"layer": 3, "name": "Sell Simulation", "stage": "Pre-buy", "cost": "Math only", "rejection": "Can't sell / high tax"},
+      {"layer": 4, "name": "Entity Graph", "stage": "Pre-buy", "cost": "<2ms query", "rejection": "Near rugger / Sybil"},
+      {"layer": 5, "name": "5D Scorer", "stage": "Decision", "cost": "In-memory", "rejection": "Score too low / instant kill"},
+      {"layer": 6, "name": "Price Impact Gate", "stage": "Final check", "cost": "Math only", "rejection": "Impact > 10%"},
+      {"layer": 7, "name": "CSM (Continuous)", "stage": "Post-buy", "cost": "RPC calls co 30s", "rejection": "Panic/warning sells"}
+    ]
+  },
+
+  "key_data_structures": {
+    "PoolInfo": {
+      "package": "solana",
+      "fields": ["PoolAddress", "DEX (raydium|pumpfun|orca|meteora)", "TokenMint", "QuoteMint", "TokenReserve", "QuoteReserve", "LiquidityUSD", "PriceUSD", "Volume24hUSD", "CreatedAt", "LPBurned", "LPLocked", "PoolOpenTime"]
+    },
+    "TokenInfo": {
+      "package": "solana",
+      "fields": ["Mint", "Name", "Symbol", "Decimals", "TotalSupply", "MintAuthority", "FreezeAuthority"]
+    },
+    "EntityReport": {
+      "package": "graph",
+      "fields": ["DeployerAddress", "RiskScore (0-100)", "Labels[]", "ClusterSize", "SeedFunder", "SeedFunderLabels[]", "HopsToRugger (-1 if none)", "HopsToInsider (-1 if none)", "Confidence (0-1)", "QueryTimeNs"]
+    },
+    "TokenScore": {
+      "package": "scanner",
+      "fields": ["Total (0-100)", "Safety", "Entity", "Social", "OnChain", "Timing", "Recommendation", "InstantKill", "KillReason", "CorrelationType"]
+    },
+    "Position": {
+      "package": "sniper",
+      "fields": ["ID", "TokenMint", "PoolAddress", "DEX", "EntryPriceUSD", "AmountToken", "CostSOL", "CurrentPrice", "HighestPrice", "PnLPct", "SafetyScore", "BuySignature", "SellSignature", "Status", "OpenedAt", "ClosedAt", "CloseReason", "SellRetries"]
+    }
+  },
+
+  "recent_fixes_v32": {
+    "commit": "78a7d5a",
+    "description": "Critical P0 bugs + P1 safety improvements",
+    "p0_fixes": [
+      {
+        "bug": "Budget race condition",
+        "file": "sniper.go",
+        "issue": "reserveDailyBudget() sprawdzał limit ale nie rezerwował — 2 concurrent buys mogły przekroczyć limit",
+        "fix": "Pre-deduct w reserveDailyBudget + refundDailyBudget na buy failure"
+      },
+      {
+        "bug": "Deployer lookup — używał TokenMint zamiast deployer address",
+        "file": "sanitizer.go",
+        "issue": "checkDeployerHistory używał pool.TokenMint jako deployer proxy — każdy token unikalny, filtr nigdy nie łapał serial deployerów",
+        "fix": "Wyciągamy SeedFunder z EntityReport w F5 i przekazujemy do F6"
+      },
+      {
+        "bug": "Exit tracker context leak",
+        "file": "sniper.go",
+        "issue": "Sell goroutiny w UpdatePrice używały ctx caller'a — short-lived context mógł anulować sell",
+        "fix": "context.WithTimeout(context.Background(), 60s) dla wszystkich sell goroutines"
+      },
+      {
+        "bug": "entryScores cache memory leak",
+        "file": "main.go",
+        "issue": "entryScores.Store() dla WSZYSTKICH tokenów (w tym skipped/killed) — cleanup tylko w onPositionClose",
+        "fix": "Store dopiero po przejściu wszystkich checks, tuż przed OnDiscovery"
+      }
+    ],
+    "p1_improvements": [
+      "Price impact check (>10% = reject)",
+      "Duplicate mint detection (sync.Map processingMints)",
+      "CSM graduated response (partial sell 25-50% na warnings)",
+      "SellSim pool fee (0.25% AMM fee w formule constant product)",
+      "FNV-1a hash dla cluster ID (zamiast słabego *31 loop)",
+      "tpLevelReason fix (strconv.Itoa zamiast rune conversion)",
+      "Sybil cluster size fix (fmt.Sprintf zamiast rune)",
+      "Cyrillic Unicode range fix (0x0400-0x04FF)"
+    ]
+  },
+
+  "testing": {
+    "test_packages": [
+      "internal/backtest", "internal/clickhouse", "internal/config",
+      "internal/copytrade", "internal/correlation", "internal/execution",
+      "internal/features", "internal/graph", "internal/honeypot",
+      "internal/intel", "internal/liquidity", "internal/narrative",
+      "internal/observability", "internal/quality", "internal/regime",
+      "internal/risk", "internal/scanner", "internal/sniper",
+      "internal/solana", "internal/strategy"
+    ],
+    "total_packages_with_tests": 20,
+    "stub_mode": "StubRPCClient pozwala testować bez real Solana",
+    "dry_run": "Pełna symulacja tradingu bez real transactions"
+  },
+
+  "deployment": {
+    "flags": {
+      "-config": "Path to config YAML (default: config/config.yaml)",
+      "-stub": "Use stub RPC (no real Solana connection)",
+      "-snapshot-dir": "Directory for graph snapshots (default: data/snapshots)"
+    },
+    "graceful_shutdown": [
+      "1. Cancel all CSMs",
+      "2. Close graph snapshot loop (save final state)",
+      "3. Stop fee estimator",
+      "4. ForceClose all open positions (30s timeout)",
+      "5. Disconnect Jupiter",
+      "6. Wait for all goroutines"
+    ],
+    "monitoring": {
+      "http_health": "/health endpoint",
+      "periodic_stats": "Log stats co 30s (pools scanned, snipes, wins/losses, daily spent)",
+      "control_plane": "HTTP POST /control/pause|resume|kill"
+    }
+  }
+}
